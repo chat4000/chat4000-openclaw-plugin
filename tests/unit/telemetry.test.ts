@@ -51,11 +51,11 @@ describe("telemetry", () => {
         runtime: {
           name: "node",
           env: { SECRET: "value" },
-        } as Record<string, unknown>,
+        },
         os: {
           name: "darwin",
           kernel_version: "private",
-        } as Record<string, unknown>,
+        },
       },
     };
 

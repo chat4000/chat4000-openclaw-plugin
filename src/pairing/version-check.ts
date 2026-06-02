@@ -28,7 +28,7 @@ export function pluginPlatform(): string {
 /** Ask the registrar whether this plugin build is servable / must upgrade. */
 export async function checkPluginVersion(params: {
   registrar: RegistrarClient;
-  releaseChannel?: string;
+  releaseChannel?: string | undefined;
 }): Promise<VersionPolicyResult> {
   return params.registrar.checkVersion({
     appId: readPackageName(),

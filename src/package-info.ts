@@ -2,9 +2,19 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-function readOwnPackageJson(): { version?: string; name?: string } {
+function readOwnPackageJson(): { version?: string | undefined; name?: string | undefined } {
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-  return JSON.parse(readFileSync(path.join(moduleDir, "..", "package.json"), "utf8"));
+  const parsed: unknown = JSON.parse(
+    readFileSync(path.join(moduleDir, "..", "package.json"), "utf8"),
+  );
+  if (parsed && typeof parsed === "object") {
+    const pkg = parsed as { version?: unknown; name?: unknown };
+    return {
+      version: typeof pkg.version === "string" ? pkg.version : undefined,
+      name: typeof pkg.name === "string" ? pkg.name : undefined,
+    };
+  }
+  return {};
 }
 
 export function readPackageVersion(): string {

@@ -11,16 +11,12 @@
  * account, and re-verified against the synced state before reuse, so a restart
  * never spawns duplicates.
  */
-import {
-  type ICreateRoomOpts,
-  type MatrixClient,
-  Preset,
-  Visibility,
-} from "matrix-js-sdk";
+import { type ICreateRoomOpts, type MatrixClient, Preset, Visibility } from "matrix-js-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { resolveChat4000AccountStateDir } from "../paths.js";
 import { ROOM_KIND_STATE_EVENT } from "./inbound.js";
+import { sendCustomStateEvent } from "./sdk-boundary.js";
 
 const ROOM_ENCRYPTION = "m.room.encryption";
 const SPACE_CHILD = "m.space.child";
@@ -58,19 +54,18 @@ function serverNameOf(userId: string): string {
 }
 
 /**
- * Send a state event. matrix-js-sdk's `sendStateEvent` type only allows known
- * event types; we use custom ones (m.space.child/parent, room_kind), so we cast
- * at the call boundary (same pattern as send.ts).
+ * Send a state event with a custom type. matrix-js-sdk's `sendStateEvent` union
+ * only allows known event types; ours (m.space.child/parent, room_kind) are
+ * custom, so the unavoidable widening lives in the shared SDK boundary helper.
  */
-function sendState(
+async function sendState(
   client: MatrixClient,
   roomId: string,
   type: string,
   content: Record<string, unknown>,
   stateKey: string,
-): Promise<unknown> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (client.sendStateEvent as any)(roomId, type, content, stateKey);
+): Promise<void> {
+  await sendCustomStateEvent(client, roomId, type, content, stateKey);
 }
 
 /** True if the client is joined to a room with this id (per synced state). */
@@ -91,7 +86,11 @@ function roomKindState(
 }
 
 /** Link a child room under the space (both directions). */
-async function linkChild(client: MatrixClient, spaceId: string, childRoomId: string): Promise<void> {
+async function linkChild(
+  client: MatrixClient,
+  spaceId: string,
+  childRoomId: string,
+): Promise<void> {
   const via = [serverNameOf(client.getUserId() ?? "")].filter(Boolean);
   await sendState(client, spaceId, SPACE_CHILD, { via }, childRoomId);
   await sendState(client, childRoomId, SPACE_PARENT, { via, canonical: true }, spaceId);
@@ -141,7 +140,7 @@ export async function ensurePluginRooms(
  */
 export async function createSessionRoom(
   client: MatrixClient,
-  params: { spaceId: string; title?: string; inviteUserId?: string },
+  params: { spaceId: string; title?: string | undefined; inviteUserId?: string | undefined },
 ): Promise<string> {
   const res = await client.createRoom({
     name: params.title || "chat4000 session",
@@ -152,15 +151,6 @@ export async function createSessionRoom(
   });
   await linkChild(client, params.spaceId, res.room_id);
   return res.room_id;
-}
-
-/** Invite a paired user into the control room AND the space (PROTOCOL E). */
-export async function inviteToControlAndSpace(
-  client: MatrixClient,
-  params: { spaceId: string; controlRoomId: string; userId: string },
-): Promise<void> {
-  await client.invite(params.controlRoomId, params.userId);
-  await client.invite(params.spaceId, params.userId);
 }
 
 /** Rename a session room (`session.rename`). */

@@ -2,12 +2,12 @@
 
 export type Chat4000ProvisioningConfig = {
   /** Registrar base URL, e.g. https://registrar.chat4000.com (PROTOCOL §3). */
-  url?: string;
+  url?: string | undefined;
   /** SERVICE_TOKEN bearer the plugin uses for /pair/register and /pair/status. */
-  serviceToken?: string;
+  serviceToken?: string | undefined;
 };
 
-export type Chat4000AccountConfig = {
+type Chat4000AccountConfig = {
   enabled?: boolean;
   pairingLogLevel?: "info" | "debug";
   runtimeLogLevel?: "info" | "debug";
@@ -46,18 +46,10 @@ export type ResolvedChat4000Account = {
   userId: string;
   accessToken: string;
   deviceId: string;
-  pluginId?: string;
+  pluginId?: string | undefined;
   /** Where the credentials came from. */
   credentialSource: "state-file" | "config" | "env" | "missing";
   /** Resolved registrar settings (url + serviceToken), if configured. */
   provisioning: Chat4000ProvisioningConfig;
   config: Chat4000AccountConfig;
-};
-
-// ─── Probe result ───────────────────────────────────────────────────────────
-
-export type Chat4000Probe = {
-  ok: boolean;
-  error?: string;
-  latencyMs?: number;
 };

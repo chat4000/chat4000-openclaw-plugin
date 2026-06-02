@@ -66,7 +66,9 @@ export async function runChat4000Migration(params: {
     if (!registrar) {
       write("No v2 Matrix identity and no registrar configured. Provide a SERVICE_TOKEN");
       write("(--service-token / CHAT4000_SERVICE_TOKEN) to self-onboard, or run:");
-      write("  openclaw chat4000 setup --user-id <@plugin_x:hs> --access-token <t> --device-id <d>");
+      write(
+        "  openclaw chat4000 setup --user-id <@plugin_x:hs> --access-token <t> --device-id <d>",
+      );
       return { migrated: false, reason: "no-identity", snapshotDir: snapshot.archiveDir };
     }
     write("Self-onboarding a Matrix bot identity via the registrar...");

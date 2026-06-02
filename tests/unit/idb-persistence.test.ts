@@ -7,10 +7,14 @@ import { persistIdbToDisk, restoreIdbFromDisk } from "../../src/matrix/idb-persi
 
 const DB_NAME = "chat4000-test::crypto";
 
+function idbErr(error: DOMException | null): Error {
+  return error ?? new Error("IndexedDB request failed");
+}
+
 function req<T>(r: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
+    r.onerror = () => reject(idbErr(r.error));
   });
 }
 
@@ -19,7 +23,7 @@ function openCreating(): Promise<IDBDatabase> {
     const r = indexedDB.open(DB_NAME, 1);
     r.onupgradeneeded = () => r.result.createObjectStore("s", { keyPath: "id" });
     r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
+    r.onerror = () => reject(idbErr(r.error));
   });
 }
 
@@ -27,7 +31,7 @@ function openExisting(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const r = indexedDB.open(DB_NAME, 1);
     r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
+    r.onerror = () => reject(idbErr(r.error));
   });
 }
 

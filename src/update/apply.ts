@@ -28,15 +28,15 @@ const run = promisify(execFile);
 
 export type ApplyUpdateOptions = {
   /** Install this exact version. Defaults to the preflight's latest. */
-  targetVersion?: string;
+  targetVersion?: string | undefined;
   /** Update even if preflight says not updatable (still requires a target). */
-  force?: boolean;
+  force?: boolean | undefined;
   /** Restart the gateway after install so the new code loads. */
-  restart?: boolean;
+  restart?: boolean | undefined;
   /** Seconds to wait before a detached/foreground restart, so callers can reply first. */
-  restartDelaySeconds?: number;
-  timeoutMs?: number;
-  log?: (line: string) => void;
+  restartDelaySeconds?: number | undefined;
+  timeoutMs?: number | undefined;
+  log?: ((line: string) => void) | undefined;
 };
 
 export type ApplyUpdateResult = {
@@ -63,7 +63,10 @@ async function installVersion(
   const openclaw = resolveOpenclawBin();
   const spec = `${packageName}@${version}`;
   // Current CLI is `plugins install`; older is `plugin install`. Try both.
-  for (const sub of [["plugins", "install", "--force", spec], ["plugin", "install", "--force", spec]]) {
+  for (const sub of [
+    ["plugins", "install", "--force", spec],
+    ["plugin", "install", "--force", spec],
+  ]) {
     log(`$ ${openclaw} ${sub.join(" ")}`);
     try {
       const { stdout, stderr } = await run(openclaw, sub, { timeout: timeoutMs });
@@ -175,11 +178,7 @@ export async function applyUpdate(opts: ApplyUpdateOptions = {}): Promise<ApplyU
     // Drop the boot marker BEFORE the restart fires so the next boot can guard
     // the new version and auto-roll-back if it fails to come up (boot-guard.ts).
     writeUpdateMarker(preflight.currentVersion, target);
-    restartScheduled = scheduleRestart(
-      preflight.restartMethod,
-      opts.restartDelaySeconds ?? 3,
-      log,
-    );
+    restartScheduled = scheduleRestart(preflight.restartMethod, opts.restartDelaySeconds ?? 3, log);
     if (!restartScheduled) {
       // No restart actually scheduled — don't leave a marker that would later
       // mis-fire a rollback.

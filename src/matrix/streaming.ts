@@ -28,7 +28,7 @@ export class MatrixDraftStream {
 
   private readonly throttleMs: number;
 
-  private readonly log?: (msg: string) => void;
+  private readonly log?: ((msg: string) => void) | undefined;
 
   private eventId: string | undefined;
 

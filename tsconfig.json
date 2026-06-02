@@ -4,6 +4,11 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "strict": true,
+    "useUnknownInCatchVariables": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "outDir": "dist",
@@ -11,6 +16,6 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["index.ts", "src/**/*.ts", "src/**/*.d.ts"],
+  "include": ["index.ts", "channel-plugin-api.ts", "src/**/*.ts", "src/**/*.d.ts"],
   "exclude": ["node_modules", "dist", "tests"]
 }

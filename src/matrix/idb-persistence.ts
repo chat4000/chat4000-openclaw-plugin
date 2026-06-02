@@ -22,6 +22,11 @@ import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
 
 type Logger = (line: string) => void;
 
+/** Coerce an IndexedDB request error (DOMException | null) into a real Error. */
+function idbError(error: DOMException | null): Error {
+  return error ?? new Error("IndexedDB request failed");
+}
+
 type IdbStoreSnapshot = {
   name: string;
   keyPath: IDBObjectStoreParameters["keyPath"];
@@ -96,7 +101,7 @@ function parseSnapshotPayload(data: string): IdbDatabaseSnapshot[] | null {
 function idbReq<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     req.addEventListener("success", () => resolve(req.result), { once: true });
-    req.addEventListener("error", () => reject(req.error), { once: true });
+    req.addEventListener("error", () => reject(idbError(req.error)), { once: true });
   });
 }
 
@@ -112,7 +117,7 @@ async function dumpIndexedDatabases(databasePrefix?: string): Promise<IdbDatabas
     const db: IDBDatabase = await new Promise((resolve, reject) => {
       const r = idb.open(name, version);
       r.addEventListener("success", () => resolve(r.result), { once: true });
-      r.addEventListener("error", () => reject(r.error), { once: true });
+      r.addEventListener("error", () => reject(idbError(r.error)), { once: true });
     });
 
     const stores: IdbStoreSnapshot[] = [];
@@ -121,7 +126,7 @@ async function dumpIndexedDatabases(databasePrefix?: string): Promise<IdbDatabas
       const store = tx.objectStore(storeName);
       const storeInfo: IdbStoreSnapshot = {
         name: storeName,
-        keyPath: store.keyPath as IDBObjectStoreParameters["keyPath"],
+        keyPath: store.keyPath,
         autoIncrement: store.autoIncrement,
         indexes: [],
         records: [],
@@ -136,7 +141,7 @@ async function dumpIndexedDatabases(databasePrefix?: string): Promise<IdbDatabas
         });
       }
       const keys = await idbReq(store.getAllKeys());
-      const values = await idbReq(store.getAll());
+      const values: unknown[] = await idbReq<unknown[]>(store.getAll());
       storeInfo.records = keys.map((k, i) => ({ key: k, value: values[i] }));
       stores.push(storeInfo);
     }
@@ -155,11 +160,16 @@ async function restoreIndexedDatabases(snapshot: IdbDatabaseSnapshot[]): Promise
         const db = r.result;
         for (const storeSnap of dbSnap.stores) {
           const opts: IDBObjectStoreParameters = {};
-          if (storeSnap.keyPath !== null) opts.keyPath = storeSnap.keyPath;
+          if (storeSnap.keyPath !== null && storeSnap.keyPath !== undefined) {
+            opts.keyPath = storeSnap.keyPath;
+          }
           if (storeSnap.autoIncrement) opts.autoIncrement = true;
           const store = db.createObjectStore(storeSnap.name, opts);
           for (const idx of storeSnap.indexes) {
-            store.createIndex(idx.name, idx.keyPath, { unique: idx.unique, multiEntry: idx.multiEntry });
+            store.createIndex(idx.name, idx.keyPath, {
+              unique: idx.unique,
+              multiEntry: idx.multiEntry,
+            });
           }
         }
       });
@@ -186,7 +196,7 @@ async function restoreIndexedDatabases(snapshot: IdbDatabaseSnapshot[]): Promise
         },
         { once: true },
       );
-      r.addEventListener("error", () => reject(r.error), { once: true });
+      r.addEventListener("error", () => reject(idbError(r.error)), { once: true });
     });
   }
 }

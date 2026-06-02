@@ -37,7 +37,14 @@ function formatValue(value: unknown): string {
   if (typeof value === "string") {
     return value.includes(" ") ? JSON.stringify(value) : value;
   }
-  return String(value);
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "symbol") {
+    return value.toString();
+  }
+  // Objects / functions: JSON where possible, else a stable marker.
+  return JSON.stringify(value) ?? "[unserializable]";
 }
 
 export class RuntimeLogger {

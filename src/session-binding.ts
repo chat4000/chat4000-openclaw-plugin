@@ -36,13 +36,13 @@ export type OpenClawSessionCandidate = {
   agentId: string;
   sessionId: string;
   storePath: string;
-  sessionFile?: string;
+  sessionFile?: string | undefined;
   updatedAt: number;
   label: string;
-  lastPreview?: string;
-  lastChannel?: string;
-  lastTo?: string;
-  lastAccountId?: string;
+  lastPreview?: string | undefined;
+  lastChannel?: string | undefined;
+  lastTo?: string | undefined;
+  lastAccountId?: string | undefined;
 };
 
 export type Chat4000SessionBinding = {
@@ -53,8 +53,8 @@ export type Chat4000SessionBinding = {
   storePath: string;
   sessionId: string;
   label: string;
-  lastPreview?: string;
-  lastChannel?: string;
+  lastPreview?: string | undefined;
+  lastChannel?: string | undefined;
   updatedAt: number;
   boundAt: string;
 };
@@ -90,7 +90,9 @@ function resolveConfiguredSessionStorePath(
   if (!rawStore) {
     return undefined;
   }
-  const withAgent = rawStore.includes("{agentId}") ? rawStore.replaceAll("{agentId}", agentId) : rawStore;
+  const withAgent = rawStore.includes("{agentId}")
+    ? rawStore.replaceAll("{agentId}", agentId)
+    : rawStore;
   return expandHomePath(withAgent);
 }
 
@@ -130,7 +132,11 @@ function isUserFacingSessionKey(sessionKey: string): boolean {
   if (!sessionKey.startsWith("agent:")) {
     return false;
   }
-  return !sessionKey.includes(":cron:") && !sessionKey.includes(":acp:") && !sessionKey.includes(":subagent:");
+  return (
+    !sessionKey.includes(":cron:") &&
+    !sessionKey.includes(":acp:") &&
+    !sessionKey.includes(":subagent:")
+  );
 }
 
 function extractTextFromTranscriptContent(content: unknown): string | null {
@@ -162,7 +168,9 @@ function readLastTranscriptPreview(candidatePaths: string[]): string | undefined
       continue;
     }
     try {
-      const lines = readFileSync(candidate, "utf8").split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const lines = readFileSync(candidate, "utf8")
+        .split(/\r?\n/)
+        .filter((line) => line.trim().length > 0);
       for (let index = lines.length - 1; index >= 0; index -= 1) {
         const parsed = JSON.parse(lines[index] ?? "") as { message?: { content?: unknown } };
         const text = extractTextFromTranscriptContent(parsed.message?.content);
@@ -186,12 +194,16 @@ function resolveTranscriptCandidates(
   const candidates = new Set<string>();
   const sessionFile = normalizeNonEmptyString(entry.sessionFile);
   if (sessionFile) {
-    candidates.add(path.isAbsolute(sessionFile) ? sessionFile : path.join(sessionsDir, sessionFile));
+    candidates.add(
+      path.isAbsolute(sessionFile) ? sessionFile : path.join(sessionsDir, sessionFile),
+    );
   }
   candidates.add(path.join(sessionsDir, `${sessionId}.jsonl`));
   const threadId = normalizeNonEmptyString(entry.lastThreadId);
   if (threadId) {
-    candidates.add(path.join(sessionsDir, `${sessionId}-topic-${encodeURIComponent(threadId)}.jsonl`));
+    candidates.add(
+      path.join(sessionsDir, `${sessionId}-topic-${encodeURIComponent(threadId)}.jsonl`),
+    );
   }
   return [...candidates];
 }
@@ -202,7 +214,9 @@ function readSessionStore(storePath: string): Record<string, SessionStoreEntry> 
   }
   try {
     const parsed = JSON.parse(readFileSync(storePath, "utf8")) as UnknownRecord;
-    const entries = Object.entries(parsed).filter(([, value]) => value && typeof value === "object");
+    const entries = Object.entries(parsed).filter(
+      ([, value]) => value && typeof value === "object",
+    );
     return Object.fromEntries(entries) as Record<string, SessionStoreEntry>;
   } catch {
     return {};
@@ -221,7 +235,9 @@ export function listOpenClawSessionCandidates(
       }
       const sessionId = normalizeNonEmptyString(entry.sessionId);
       const updatedAt = normalizeNumber(entry.updatedAt);
-      const agentId = parseAgentIdFromSessionKey(sessionKey) ?? path.basename(path.dirname(path.dirname(storePath)));
+      const agentId =
+        parseAgentIdFromSessionKey(sessionKey) ??
+        path.basename(path.dirname(path.dirname(storePath)));
       if (!sessionId || !updatedAt || !agentId) {
         continue;
       }
@@ -263,7 +279,9 @@ export function findOpenClawSessionCandidate(
   if (!trimmed) {
     return null;
   }
-  return listOpenClawSessionCandidates(cfg).find((candidate) => candidate.sessionKey === trimmed) ?? null;
+  return (
+    listOpenClawSessionCandidates(cfg).find((candidate) => candidate.sessionKey === trimmed) ?? null
+  );
 }
 
 function loadBindingsFile(): StoredBindingsFile {
@@ -276,7 +294,7 @@ function loadBindingsFile(): StoredBindingsFile {
     if (parsed.version !== 1 || !parsed.bindings || typeof parsed.bindings !== "object") {
       return { version: 1, bindings: {} };
     }
-    return { version: 1, bindings: parsed.bindings as Record<string, Chat4000SessionBinding> };
+    return { version: 1, bindings: parsed.bindings };
   } catch {
     return { version: 1, bindings: {} };
   }

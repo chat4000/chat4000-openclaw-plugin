@@ -22,9 +22,9 @@ import { readPackageName, readPackageVersion, resolvePackageRoot } from "../pack
 
 const run = promisify(execFile);
 
-export type ProbeStatus = "ok" | "blocked" | "unknown";
+type ProbeStatus = "ok" | "blocked" | "unknown";
 
-export type Probe = {
+type Probe = {
   name: string;
   status: ProbeStatus;
   detail: string;
@@ -44,8 +44,14 @@ export type UpdatePreflight = {
 };
 
 function compareSemver(a: string, b: string): number {
-  const pa = a.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
-  const pb = b.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const pa = a
+    .replace(/^v/, "")
+    .split(".")
+    .map((n) => Number.parseInt(n, 10) || 0);
+  const pb = b
+    .replace(/^v/, "")
+    .split(".")
+    .map((n) => Number.parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i += 1) {
     if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
   }
@@ -90,7 +96,11 @@ async function probeRegistry(timeoutMs: number): Promise<Probe> {
     await run("npm", ["ping"], { timeout: timeoutMs });
     return { name: "registry", status: "ok", detail: "npm registry reachable" };
   } catch {
-    return { name: "registry", status: "unknown", detail: "could not reach npm registry (npm ping failed)" };
+    return {
+      name: "registry",
+      status: "unknown",
+      detail: "could not reach npm registry (npm ping failed)",
+    };
   }
 }
 
@@ -116,7 +126,11 @@ async function probeRestart(timeoutMs: number): Promise<{ probe: Probe; method: 
     if (stdout.includes("openclaw-gateway")) {
       return {
         method: "docker",
-        probe: { name: "restart", status: "ok", detail: "docker: restart openclaw-gateway container" },
+        probe: {
+          name: "restart",
+          status: "ok",
+          detail: "docker: restart openclaw-gateway container",
+        },
       };
     }
   } catch {
@@ -148,7 +162,9 @@ async function probeRestart(timeoutMs: number): Promise<{ probe: Probe; method: 
   };
 }
 
-export async function checkUpdatePreflight(opts: { timeoutMs?: number } = {}): Promise<UpdatePreflight> {
+export async function checkUpdatePreflight(
+  opts: { timeoutMs?: number } = {},
+): Promise<UpdatePreflight> {
   const timeoutMs = opts.timeoutMs ?? 8000;
   const packageName = readPackageName();
   const currentVersion = readPackageVersion();
@@ -171,7 +187,11 @@ export async function checkUpdatePreflight(opts: { timeoutMs?: number } = {}): P
           ? `newer version ${latestVersion} available (have ${currentVersion})`
           : `already up to date (${currentVersion})`,
       }
-    : { name: "version", status: "unknown", detail: "could not resolve the latest published version" };
+    : {
+        name: "version",
+        status: "unknown",
+        detail: "could not resolve the latest published version",
+      };
 
   const probes = [versionProbe, writableProbe, npmProbe, registryProbe, restart.probe];
 
@@ -194,7 +214,7 @@ export async function checkUpdatePreflight(opts: { timeoutMs?: number } = {}): P
 
 /** Human-readable one-line-per-probe summary. */
 export function formatPreflight(p: UpdatePreflight): string {
-  const icon = (s: ProbeStatus) => (s === "ok" ? "✓" : s === "blocked" ? "✗" : "?");
+  const icon = (s: ProbeStatus): string => (s === "ok" ? "✓" : s === "blocked" ? "✗" : "?");
   const lines = [
     `package: ${p.packageName}`,
     `current: ${p.currentVersion}`,

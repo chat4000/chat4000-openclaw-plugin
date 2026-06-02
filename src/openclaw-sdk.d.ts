@@ -1,5 +1,5 @@
 declare module "openclaw/plugin-sdk/channel-entry-contract" {
-  export function defineBundledChannelEntry<TPlugin = unknown>(options: {
+  export function defineBundledChannelEntry<TPlugin = unknown, TApi = unknown>(options: {
     id: string;
     name: string;
     description: string;
@@ -8,8 +8,8 @@ declare module "openclaw/plugin-sdk/channel-entry-contract" {
       specifier: string;
       exportName?: string;
     };
-    registerCliMetadata?: (api: any) => void;
-    registerFull?: (api: any) => void;
+    registerCliMetadata?: (api: TApi) => void;
+    registerFull?: (api: TApi) => void;
   }): TPlugin;
 }
 

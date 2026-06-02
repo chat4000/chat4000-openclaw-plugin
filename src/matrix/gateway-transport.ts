@@ -58,8 +58,8 @@ export type GatewayTransportOptions = {
    * batch that carried to-device keys, so the gateway only deletes server-side
    * room keys we have already saved (PROTOCOL D.2).
    */
-  flushBeforeAck?: () => Promise<void>;
-  log?: Logger;
+  flushBeforeAck?: (() => Promise<void>) | undefined;
+  log?: Logger | undefined;
   /** Per-`req` response timeout. */
   requestTimeoutMs?: number;
   /** How long a sync wait blocks before returning an empty delta (long-poll-ish). */
@@ -111,13 +111,13 @@ export class GatewayTransport {
 
   private readonly accessToken: string;
 
-  private readonly clientIdentity?: GatewayClientIdentity;
+  private readonly clientIdentity?: GatewayClientIdentity | undefined;
 
-  private readonly posFilePath?: string;
+  private readonly posFilePath?: string | undefined;
 
-  private readonly flushBeforeAck?: () => Promise<void>;
+  private readonly flushBeforeAck?: (() => Promise<void>) | undefined;
 
-  private readonly log?: Logger;
+  private readonly log?: Logger | undefined;
 
   private readonly requestTimeoutMs: number;
 
@@ -185,16 +185,20 @@ export class GatewayTransport {
     // gateway host, NOT the WS — the request URL already points there
     // (baseUrl = the gateway origin). Hand it straight to real HTTP.
     if (isMediaPath(path)) {
-      return globalThis.fetch(resource as RequestInfo, init);
+      return globalThis.fetch(resource, init);
     }
-    let body = await extractJsonBody(resource, init);
+    let body = extractJsonBody(init);
     // G2 (PROTOCOL E): inject the cleartext `chat4000.push` flag into an outgoing
     // message send (keyed by the txnId in the path) so it sits outside the
     // encrypted payload where the homeserver push rule can read it.
     body = injectPushFlag(path, body);
     const { status, body: respBody } = await this.request(method, path, body);
     const text =
-      typeof respBody === "string" ? respBody : respBody === undefined ? "" : JSON.stringify(respBody);
+      typeof respBody === "string"
+        ? respBody
+        : respBody === undefined
+          ? ""
+          : JSON.stringify(respBody);
     return new Response(text, {
       status,
       headers: { "content-type": "application/json" },
@@ -293,7 +297,7 @@ export class GatewayTransport {
       case "auth_ok": {
         this.connected = true;
         this.backoffMs = 0;
-        this.log?.info?.(`gateway auth ok (${String(frame.user_id ?? "")})`);
+        this.log?.info?.(`gateway auth ok (${str(frame.user_id)})`);
         this.authSettle?.resolve();
         this.authSettle = undefined;
         // On a reconnect, resume the sync stream where we left off.
@@ -303,7 +307,7 @@ export class GatewayTransport {
         return;
       }
       case "auth_error": {
-        const reason = String(frame.reason ?? "auth rejected");
+        const reason = str(frame.reason, "auth rejected");
         this.log?.error?.(`gateway auth error: ${reason}`);
         this.authSettle?.reject(new Error(`gateway auth error: ${reason}`));
         this.authSettle = undefined;
@@ -323,7 +327,7 @@ export class GatewayTransport {
         return;
       }
       case "resp": {
-        const id = String(frame.id ?? "");
+        const id = str(frame.id);
         const p = this.pending.get(id);
         if (!p) return;
         this.pending.delete(id);
@@ -332,7 +336,7 @@ export class GatewayTransport {
         return;
       }
       case "error": {
-        this.log?.warn?.(`gateway error frame: ${String(frame.reason ?? "")}`);
+        this.log?.warn?.(`gateway error frame: ${str(frame.reason)}`);
         return;
       }
       case "sync": {
@@ -536,6 +540,11 @@ export class GatewayTransport {
   }
 }
 
+/** Safely stringify an unknown frame field, falling back when it isn't a string. */
+function str(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : value == null ? fallback : JSON.stringify(value);
+}
+
 // ── request shaping helpers ───────────────────────────────────────────────────
 
 /** Media passthrough paths (PROTOCOL D.3) — these go over HTTP, not the WS. */
@@ -565,7 +574,7 @@ const SEND_EVENT_PATH = /\/rooms\/[^/]+\/send\/(m\.room\.encrypted|m\.room\.mess
  */
 function injectPushFlag(path: string, body: unknown): unknown {
   const m = SEND_EVENT_PATH.exec(path);
-  if (!m) return body;
+  if (!m?.[2]) return body;
   const txnId = decodeURIComponent(m[2]);
   const push = getPush(txnId);
   if (push === undefined) return body;
@@ -574,7 +583,10 @@ function injectPushFlag(path: string, body: unknown): unknown {
   return obj;
 }
 
-function describeRequest(resource: URL | RequestInfo, init?: RequestInit): {
+function describeRequest(
+  resource: URL | RequestInfo,
+  init?: RequestInit,
+): {
   method: string;
   path: string;
 } {
@@ -596,8 +608,8 @@ function describeRequest(resource: URL | RequestInfo, init?: RequestInit): {
   };
 }
 
-async function extractJsonBody(resource: URL | RequestInfo, init?: RequestInit): Promise<unknown> {
-  const raw = init?.body ?? (typeof resource === "object" && "url" in resource ? undefined : undefined);
+function extractJsonBody(init?: RequestInit): unknown {
+  const raw = init?.body;
   if (raw == null) return undefined;
   if (typeof raw === "string") {
     try {

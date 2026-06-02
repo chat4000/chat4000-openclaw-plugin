@@ -14,8 +14,8 @@ import { resolveChat4000PluginDir } from "../paths.js";
 
 export type V1StateDetection = {
   present: boolean;
-  keyFile?: string;
-  sqliteFile?: string;
+  keyFile?: string | undefined;
+  sqliteFile?: string | undefined;
   /** All v1 paths that exist (for snapshotting). */
   paths: string[];
 };

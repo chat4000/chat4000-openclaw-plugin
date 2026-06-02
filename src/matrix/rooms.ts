@@ -47,7 +47,7 @@ export async function createPairedRoom(params: {
       visibility: Visibility.Private,
       is_direct: true,
       invite: [params.inviteUserId],
-      name: params.name,
+      ...(params.name ? { name: params.name } : {}),
       initial_state: [
         {
           type: EventType.RoomEncryption,

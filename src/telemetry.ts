@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ErrorEvent } from "@sentry/node";
+import type { ErrorEvent, EventHint } from "@sentry/node";
 import { readPackageVersion } from "./package-info.js";
 import { SENTRY_DSN } from "./telemetry-dsn.generated.js";
 
@@ -43,7 +43,10 @@ export function initializeChat4000Telemetry(): void {
         attachStacktrace: true,
         sampleRate: 0.2,
         tracesSampleRate: 0,
-        beforeSend: scrubEvent,
+        beforeSend: (event, hint) => {
+          const limited = rateLimitEvent(event, hint);
+          return limited ? scrubEvent(limited) : null;
+        },
         release: `chat4000-plugin@${PACKAGE_VERSION}`,
         environment: process.env.NODE_ENV || "production",
         initialScope: {
@@ -82,6 +85,71 @@ export function captureChat4000Exception(error: unknown, scope?: string): void {
   });
 }
 
+// ─── Error sink (Rule 6) ─────────────────────────────────────────────────────
+
+const RATE_LIMIT_MS = 3_600_000; // 1 hour per fingerprint
+const seen = new Map<string, { last: number; count: number }>();
+
+function errorNameMessage(error: unknown): { name: string; message: string } {
+  if (error instanceof Error) return { name: error.name, message: error.message };
+  if (error && typeof error === "object") {
+    const e = error as { name?: unknown; message?: unknown };
+    return {
+      name: typeof e.name === "string" ? e.name : "Error",
+      message: typeof e.message === "string" ? e.message : JSON.stringify(error),
+    };
+  }
+  return { name: "Error", message: String(error) };
+}
+
+/**
+ * The single error sink. Drops `AbortError`/cancellation silently, fingerprints
+ * by error name + message, rate-limits to one report per hour per fingerprint
+ * (carrying an occurrence count), never alters the error, and is non-blocking.
+ * Route every previously-swallowed UNEXPECTED catch through here.
+ */
+export function report(error: unknown, context: string): void {
+  const { name, message } = errorNameMessage(error);
+  if (name === "AbortError") return;
+
+  const fingerprint = `${name}|${message}`;
+  const now = Date.now();
+  const prior = seen.get(fingerprint);
+  if (prior && now - prior.last < RATE_LIMIT_MS) {
+    prior.count += 1;
+    return;
+  }
+  const count = (prior?.count ?? 0) + 1;
+  seen.set(fingerprint, { last: now, count });
+
+  if (!sentryClient) return;
+  sentryClient.withScope((sentryScope) => {
+    sentryScope.setTag("chat4000_scope", scrubSecrets(context));
+    if (count > 1) sentryScope.setExtra("occurrence_count", count);
+    sentryClient?.captureException(error);
+  });
+}
+
+/**
+ * `beforeSend` rate-limit (mirrors {@link report} for events Sentry captures
+ * automatically — uncaught exceptions / unhandled rejections). Drops AbortError
+ * and dedupes by name|message to 1/hour. Returns null to drop the event.
+ */
+function rateLimitEvent(event: ErrorEvent, hint: EventHint): ErrorEvent | null {
+  const original = hint.originalException;
+  const { name, message } = errorNameMessage(original);
+  if (name === "AbortError") return null;
+  const fingerprint = `${name}|${message}`;
+  const now = Date.now();
+  const prior = seen.get(fingerprint);
+  if (prior && now - prior.last < RATE_LIMIT_MS) {
+    prior.count += 1;
+    return null;
+  }
+  seen.set(fingerprint, { last: now, count: (prior?.count ?? 0) + 1 });
+  return event;
+}
+
 export async function captureChat4000TestException(): Promise<boolean> {
   initializeChat4000Telemetry();
   await sentryReady;
@@ -97,29 +165,54 @@ export async function captureChat4000TestException(): Promise<boolean> {
 export function getTelemetryStatus(argv: string[] = process.argv): TelemetryStatus {
   const installId = resolveInstallId();
   if (argv.includes("--no-telemetry")) {
-    return { enabled: false, reason: "flag", installId, persistentConfigPath: TELEMETRY_ENABLED_PATH };
+    return {
+      enabled: false,
+      reason: "flag",
+      installId,
+      persistentConfigPath: TELEMETRY_ENABLED_PATH,
+    };
   }
 
   const envVar = process.env.CHAT4000_TELEMETRY_DISABLED?.trim().toLowerCase();
   if (envVar === "1" || envVar === "true" || envVar === "yes") {
-    return { enabled: false, reason: "env", installId, persistentConfigPath: TELEMETRY_ENABLED_PATH };
+    return {
+      enabled: false,
+      reason: "env",
+      installId,
+      persistentConfigPath: TELEMETRY_ENABLED_PATH,
+    };
   }
 
   try {
     if (existsSync(TELEMETRY_ENABLED_PATH)) {
       const value = readFileSync(TELEMETRY_ENABLED_PATH, "utf8").trim().toLowerCase();
       if (value === "false") {
-        return { enabled: false, reason: "config", installId, persistentConfigPath: TELEMETRY_ENABLED_PATH };
+        return {
+          enabled: false,
+          reason: "config",
+          installId,
+          persistentConfigPath: TELEMETRY_ENABLED_PATH,
+        };
       }
       if (value === "true") {
-        return { enabled: true, reason: "config", installId, persistentConfigPath: TELEMETRY_ENABLED_PATH };
+        return {
+          enabled: true,
+          reason: "config",
+          installId,
+          persistentConfigPath: TELEMETRY_ENABLED_PATH,
+        };
       }
     }
   } catch {
     // Fall through to the default if persistent state cannot be read.
   }
 
-  return { enabled: true, reason: "default", installId, persistentConfigPath: TELEMETRY_ENABLED_PATH };
+  return {
+    enabled: true,
+    reason: "default",
+    installId,
+    persistentConfigPath: TELEMETRY_ENABLED_PATH,
+  };
 }
 
 export function setTelemetryEnabled(enabled: boolean): void {
@@ -170,9 +263,7 @@ export function scrubSecrets(text: string): string {
 }
 
 function scrubPath(value: string): string {
-  return value
-    .replaceAll(os.homedir(), "~")
-    .replace(/\/(Users|home)\/[^/]+/g, "/$1/<user>");
+  return value.replaceAll(os.homedir(), "~").replace(/\/(Users|home)\/[^/]+/g, "/$1/<user>");
 }
 
 function resolveInstallId(): string {
@@ -189,4 +280,3 @@ function resolveInstallId(): string {
     return randomUUID();
   }
 }
-

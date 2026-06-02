@@ -29,7 +29,7 @@ export const ENV_ENDPOINTS: Record<Chat4000Env, EnvEndpoints> = {
   },
 };
 
-export function normalizeEnv(value: string | undefined): Chat4000Env | undefined {
+function normalizeEnv(value: string | undefined): Chat4000Env | undefined {
   const v = value?.trim().toLowerCase();
   if (v === "stage" || v === "staging") return "stage";
   if (v === "prod" || v === "production") return "prod";

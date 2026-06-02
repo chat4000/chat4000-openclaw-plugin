@@ -10,6 +10,7 @@
  * The plugin picks the pairing `code`. Errors are JSON `{errcode, error}` with the
  * documented HTTP status.
  */
+import { randomInt } from "node:crypto";
 
 export type PairRegisterResult = {
   ok: boolean;
@@ -24,17 +25,17 @@ export type PairRedeemResult = {
   deviceId: string;
   accessToken: string;
   /** Only present for a `kind=plugin` code — the id the registrar issued. */
-  pluginId?: string;
+  pluginId?: string | undefined;
 };
 
-export type PairStatus = "pending" | "completed" | "expired";
+type PairStatus = "pending" | "completed" | "expired";
 
 export type PairStatusResult = {
   status: PairStatus;
-  userId?: string;
+  userId?: string | undefined;
 };
 
-export type VersionAction = "ok" | "recommend_upgrade" | "force_upgrade";
+type VersionAction = "ok" | "recommend_upgrade" | "force_upgrade";
 
 /** Version-policy verdict for this plugin (PROTOCOL C.5). */
 export type VersionPolicyResult = {
@@ -102,10 +103,10 @@ export class RegistrarClient {
    */
   async registerPairing(params: {
     code: string;
-    kind?: PairKind;
-    pluginId?: string;
-    userId?: string;
-    ttlSeconds?: number;
+    kind?: PairKind | undefined;
+    pluginId?: string | undefined;
+    userId?: string | undefined;
+    ttlSeconds?: number | undefined;
   }): Promise<PairRegisterResult> {
     const body = (await this.request("POST", "/pair/register", {
       auth: true,
@@ -156,9 +157,7 @@ export class RegistrarClient {
       },
     })) as Record<string, unknown>;
     const action =
-      body.action === "force_upgrade" || body.action === "recommend_upgrade"
-        ? body.action
-        : "ok";
+      body.action === "force_upgrade" || body.action === "recommend_upgrade" ? body.action : "ok";
     return {
       action,
       minVersion: typeof body.min_version === "string" ? body.min_version : null,
@@ -196,7 +195,7 @@ export class RegistrarClient {
       const res = await this.fetchImpl(`${this.baseUrl}${pathName}`, {
         method,
         headers,
-        body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+        ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
         signal: controller.signal,
       });
       const text = await res.text();
@@ -231,9 +230,6 @@ function safeJsonParse(text: string): unknown {
  * and unbiased (rejection-sampled internally), so there is no modulo skew.
  */
 export function generatePairingCode(): string {
-  // Node crypto without importing at module top to keep this tree-shake friendly.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
-  const { randomInt } = require("node:crypto") as typeof import("node:crypto");
   let code = "";
   for (let i = 0; i < 6; i += 1) code += String(randomInt(10));
   return code;

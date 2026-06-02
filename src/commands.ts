@@ -26,9 +26,9 @@ export type ControlCommand = {
 export type CommandResult = {
   command: string;
   ok: boolean;
-  error?: string;
+  error?: string | undefined;
   /** Arbitrary result payload merged into the reply. */
-  data?: Record<string, unknown>;
+  data?: Record<string, unknown> | undefined;
 };
 
 export type CommandContext = {
@@ -56,7 +56,9 @@ export async function handleControlCommand(
             updatable: pf.updatable,
             newer_available: pf.newerAvailable,
             restart_method: pf.restartMethod,
-            blockers: pf.probes.filter((p) => p.status === "blocked").map((p) => `${p.name}: ${p.detail}`),
+            blockers: pf.probes
+              .filter((p) => p.status === "blocked")
+              .map((p) => `${p.name}: ${p.detail}`),
           },
         };
       }

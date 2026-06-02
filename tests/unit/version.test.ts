@@ -26,7 +26,9 @@ describe("formatVersionNotice", () => {
   });
 
   it("flags a recommend_upgrade softly", () => {
-    const notice = formatVersionNotice(verdict({ action: "recommend_upgrade", recommended: "2.1.0" }));
+    const notice = formatVersionNotice(
+      verdict({ action: "recommend_upgrade", recommended: "2.1.0" }),
+    );
     expect(notice).toContain("recommended");
     expect(notice).not.toContain("REQUIRED");
   });

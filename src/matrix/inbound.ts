@@ -20,14 +20,16 @@ export type MatrixInboundCommand = {
 };
 
 /** chat4000 control-command msgtype (PROTOCOL E). */
-export const COMMAND_MSGTYPE = "chat4000.command";
-/** chat4000 command-result msgtype the plugin replies with. */
-export const COMMAND_RESULT_MSGTYPE = "chat4000.command_result";
+const COMMAND_MSGTYPE = "chat4000.command";
 /** Room-kind state event type, state_key "" (PROTOCOL E). `kind`: control|session. */
 export const ROOM_KIND_STATE_EVENT = "chat4000.room_kind";
 
+// `MatrixEvent.getType()` returns a plain `string`, so compare against the event
+// type's string value rather than the enum member (avoids enum-vs-string compares).
+const ROOM_MESSAGE_TYPE: string = EventType.RoomMessage;
+
 export function decodeCommandEvent(event: MatrixEvent): MatrixInboundCommand | null {
-  if (event.getType() !== EventType.RoomMessage) return null;
+  if (event.getType() !== ROOM_MESSAGE_TYPE) return null;
   if (event.isRedacted()) return null;
   const content = event.getContent();
   if (content.msgtype !== COMMAND_MSGTYPE) return null;
@@ -42,13 +44,13 @@ export function decodeCommandEvent(event: MatrixEvent): MatrixInboundCommand | n
     roomId,
     senderId,
     command,
-    args: content as Record<string, unknown>,
+    args: content,
     ts: event.getTs(),
   };
 }
 
 export function decodeInboundEvent(event: MatrixEvent): MatrixInboundMessage | null {
-  if (event.getType() !== EventType.RoomMessage) return null;
+  if (event.getType() !== ROOM_MESSAGE_TYPE) return null;
   if (event.isRedacted()) return null;
 
   const content = event.getContent();
@@ -74,7 +76,7 @@ export function decodeInboundEvent(event: MatrixEvent): MatrixInboundMessage | n
     ts: event.getTs(),
   };
 
-  const msgtype = content.msgtype as string | undefined;
+  const msgtype = content.msgtype;
   if (msgtype === MsgType.Text || msgtype === MsgType.Notice || msgtype === MsgType.Emote) {
     const text = typeof content.body === "string" ? content.body : "";
     if (!text) return null;
@@ -91,7 +93,7 @@ export function decodeInboundEvent(event: MatrixEvent): MatrixInboundMessage | n
       body: {
         kind: "media",
         mediaMsgType: msgtype === MsgType.Image ? "m.image" : "m.audio",
-        rawContent: content as Record<string, unknown>,
+        rawContent: content,
         caption: `[${label}: ${filename}]`,
       },
     };

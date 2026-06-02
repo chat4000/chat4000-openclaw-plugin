@@ -12,12 +12,11 @@
 import MarkdownIt from "markdown-it";
 import { EventType, type MatrixClient, MsgType, RelationType } from "matrix-js-sdk";
 import { markPush } from "./push-registry.js";
+import { sendCustomStateEvent, sendTimelineEvent } from "./sdk-boundary.js";
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 
 type MatrixContent = Record<string, unknown>;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type SendContent = any;
 
 function renderTextContent(text: string): MatrixContent {
   const formatted = md.render(text).trim();
@@ -48,13 +47,7 @@ export async function sendText(
 ): Promise<string> {
   const txnId = client.makeTxnId();
   markPush(txnId, push);
-  const res = await client.sendEvent(
-    roomId,
-    EventType.RoomMessage,
-    renderTextContent(text) as SendContent,
-    txnId,
-  );
-  return res.event_id;
+  return sendTimelineEvent(client, roomId, EventType.RoomMessage, renderTextContent(text), txnId);
 }
 
 /**
@@ -83,8 +76,7 @@ export async function editText(
   };
   const txnId = client.makeTxnId();
   markPush(txnId, push);
-  const res = await client.sendEvent(roomId, EventType.RoomMessage, content as SendContent, txnId);
-  return res.event_id;
+  return sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
 /**
@@ -94,7 +86,12 @@ export async function editText(
 export async function sendCommandResult(
   client: MatrixClient,
   roomId: string,
-  result: { command: string; ok: boolean; error?: string; data?: Record<string, unknown> },
+  result: {
+    command: string;
+    ok: boolean;
+    error?: string | undefined;
+    data?: Record<string, unknown> | undefined;
+  },
 ): Promise<string> {
   const content: MatrixContent = {
     msgtype: "chat4000.command_result",
@@ -107,8 +104,7 @@ export async function sendCommandResult(
   // A command result answers a device action — never wake the user for it.
   const txnId = client.makeTxnId();
   markPush(txnId, false);
-  const res = await client.sendEvent(roomId, EventType.RoomMessage, content as SendContent, txnId);
-  return res.event_id;
+  return sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
 // ── Turn anchoring, tool calls, agent status (PROTOCOL E) ────────────────────
@@ -156,8 +152,7 @@ export async function sendToolStart(
   };
   const txnId = client.makeTxnId();
   markPush(txnId, false);
-  const res = await client.sendEvent(roomId, EventType.RoomMessage, content as SendContent, txnId);
-  return res.event_id;
+  return sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
 /** Edit a tool event to its terminal state (`m.replace`). push:false. */
@@ -179,7 +174,7 @@ export async function editToolEnd(
   };
   const txnId = client.makeTxnId();
   markPush(txnId, false);
-  await client.sendEvent(roomId, EventType.RoomMessage, content as SendContent, txnId);
+  await sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
 /**
@@ -192,8 +187,7 @@ export async function sendAgentStatus(
   roomId: string,
   state: "thinking" | "working" | "typing" | "idle",
 ): Promise<void> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await (client.sendStateEvent as any)(roomId, "chat4000.status", { state }, "");
+  await sendCustomStateEvent(client, roomId, "chat4000.status", { state }, "");
 }
 
 /** Send a typing indicator (ephemeral, best-effort). */

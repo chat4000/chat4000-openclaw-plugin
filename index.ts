@@ -18,10 +18,7 @@ export {
   saveMatrixCredentials,
   deleteMatrixCredentials,
 } from "./src/matrix/credentials.js";
-export {
-  resolveChat4000CredentialsPath,
-  resolveChat4000AccountStateDir,
-} from "./src/paths.js";
+export { resolveChat4000CredentialsPath, resolveChat4000AccountStateDir } from "./src/paths.js";
 
 export default defineBundledChannelEntry({
   id: "chat4000",

@@ -42,24 +42,25 @@ import { RuntimeLogger } from "./runtime-logger.js";
 import { applyUpdate } from "./update/apply.js";
 import { reconcileUpdateMarker } from "./update/boot-guard.js";
 import { getChat4000SessionBinding } from "./session-binding.js";
+import { report } from "./telemetry.js";
 import type { ResolvedChat4000Account } from "./types.js";
 
-let replyPipelinePromise:
-  | Promise<{
-      createChannelReplyPipeline: (params: {
-        cfg: unknown;
-        agentId: string;
-        channel?: string;
-        accountId?: string;
-        typing?: {
-          start: () => Promise<void> | void;
-          onStartError?: (err: unknown) => void;
-        };
-      }) => { typingCallbacks?: unknown };
-    }>
-  | undefined;
+type ReplyPipelineRuntime = {
+  createChannelReplyPipeline: (params: {
+    cfg: unknown;
+    agentId: string;
+    channel?: string;
+    accountId?: string;
+    typing?: {
+      start: () => Promise<void> | void;
+      onStartError?: (err: unknown) => void;
+    };
+  }) => { typingCallbacks?: unknown };
+};
 
-async function loadReplyPipelineRuntime() {
+let replyPipelinePromise: Promise<ReplyPipelineRuntime> | undefined;
+
+async function loadReplyPipelineRuntime(): Promise<ReplyPipelineRuntime> {
   replyPipelinePromise ??= import("openclaw/plugin-sdk/channel-reply-pipeline").then((mod) => ({
     createChannelReplyPipeline: mod.createChannelReplyPipeline,
   }));
@@ -95,19 +96,33 @@ export const chat4000Plugin = {
   // ─── Config ─────────────────────────────────────────────────────────────
 
   config: {
-    hasConfiguredState: ({ env }: { env?: Record<string, string> }) => hasConfiguredState(env),
+    hasConfiguredState: ({ env }: { env?: Record<string, string> }): boolean =>
+      hasConfiguredState(env),
 
-    listAccountIds: (cfg?: { channels?: Record<string, unknown> }) => listChat4000AccountIds(cfg),
+    listAccountIds: (cfg?: { channels?: Record<string, unknown> }): string[] =>
+      listChat4000AccountIds(cfg),
 
-    defaultAccountId: (cfg?: { channels?: Record<string, unknown> }) =>
+    defaultAccountId: (cfg?: { channels?: Record<string, unknown> }): string =>
       getDefaultChat4000AccountId(cfg),
 
-    isConfigured: (account: ResolvedChat4000Account) => account.configured,
+    isConfigured: (account: ResolvedChat4000Account): boolean => account.configured,
 
-    resolveAccount: (cfg?: { channels?: Record<string, unknown> }, accountId?: string | null) =>
-      resolveChat4000Account({ cfg, accountId }),
+    resolveAccount: (
+      cfg?: { channels?: Record<string, unknown> },
+      accountId?: string | null,
+    ): ResolvedChat4000Account => resolveChat4000Account({ cfg, accountId }),
 
-    inspectAccount: (cfg?: { channels?: Record<string, unknown> }, accountId?: string | null) => {
+    inspectAccount: (
+      cfg?: { channels?: Record<string, unknown> },
+      accountId?: string | null,
+    ): {
+      accountId: string;
+      enabled: boolean;
+      configured: boolean;
+      userId: string;
+      gateway: string;
+      credentialStatus: string;
+    } => {
       const account = resolveChat4000Account({ cfg, accountId });
       return {
         accountId: account.accountId,
@@ -121,7 +136,14 @@ export const chat4000Plugin = {
       };
     },
 
-    describeAccount: (account: ResolvedChat4000Account) => ({
+    describeAccount: (
+      account: ResolvedChat4000Account,
+    ): {
+      name: string;
+      configured: boolean;
+      enabled: boolean;
+      extra: { gateway: string; userId: string };
+    } => ({
       name: account.userId ? `chat4000 (${account.userId})` : "chat4000",
       configured: account.configured,
       enabled: account.enabled,
@@ -145,7 +167,7 @@ export const chat4000Plugin = {
         error?: (msg: string) => void;
         debug?: (msg: string) => void;
       };
-    }) => {
+    }): Promise<void> => {
       if (!ctx.account.configured) {
         throw new Error(
           `chat4000 not configured for account "${ctx.account.accountId}". ` +
@@ -178,7 +200,7 @@ export const chat4000Plugin = {
         return; // a restart into the previous version is scheduled; abort this boot
       }
 
-      const setConnected = (connected: boolean) =>
+      const setConnected = (connected: boolean): void =>
         ctx.setStatus({
           accountId: ctx.account.accountId,
           name: `chat4000 (${ctx.account.userId})`,
@@ -243,10 +265,14 @@ export const chat4000Plugin = {
           }
         },
         onMessage: (message) => {
-          void handleInbound({ message, handle, ctx, runtimeLogger, versionBlock });
+          handleInbound({ message, handle, ctx, runtimeLogger, versionBlock }).catch(
+            (err: unknown) => report(err, "channel.handleInbound"),
+          );
         },
         onCommand: (command) => {
-          void handleCommand({ command, handle, ctx, runtimeLogger });
+          handleCommand({ command, handle, ctx, runtimeLogger }).catch((err: unknown) =>
+            report(err, "channel.handleCommand"),
+          );
         },
       });
 
@@ -268,7 +294,9 @@ export const chat4000Plugin = {
             control: handle.controlRoomId,
           });
         } catch (err) {
-          ctx.log?.warn?.(`[${ctx.account.accountId}] could not ensure plugin rooms: ${String(err)}`);
+          ctx.log?.warn?.(
+            `[${ctx.account.accountId}] could not ensure plugin rooms: ${String(err)}`,
+          );
         }
       }
 
@@ -291,7 +319,7 @@ export const chat4000Plugin = {
     base: {
       deliveryMode: "direct" as const,
       textChunkLimit: 4096,
-      sanitizeText: ({ text }: { text: string }) => text,
+      sanitizeText: ({ text }: { text: string }): string => text,
     },
     attachedResults: {
       channel: "chat4000" as const,
@@ -300,7 +328,7 @@ export const chat4000Plugin = {
         to: string;
         text: string;
         accountId?: string;
-      }) => {
+      }): Promise<{ messageId: string }> => {
         const account = resolveChat4000Account({ cfg: ctx.cfg, accountId: ctx.accountId });
         const handle = getHandle(account.accountId);
         if (!handle) {
@@ -316,7 +344,7 @@ export const chat4000Plugin = {
         text: string;
         mediaUrl?: string;
         accountId?: string;
-      }) => {
+      }): Promise<{ messageId: string }> => {
         const account = resolveChat4000Account({ cfg: ctx.cfg, accountId: ctx.accountId });
         const handle = getHandle(account.accountId);
         if (!handle) {
@@ -333,7 +361,8 @@ export const chat4000Plugin = {
         try {
           const res = await globalThis.fetch(ctx.mediaUrl);
           if (!res.ok) throw new Error(`fetch media ${res.status}`);
-          const mimeType = res.headers.get("content-type")?.split(";")[0]?.trim() || "application/octet-stream";
+          const mimeType =
+            res.headers.get("content-type")?.split(";")[0]?.trim() || "application/octet-stream";
           const bytes = new Uint8Array(await res.arrayBuffer());
           const filename = ctx.mediaUrl.split("/").pop()?.split("?")[0] || "attachment";
           if (ctx.text?.trim()) await matrixSendText(handle.client, roomId, ctx.text);
@@ -384,7 +413,7 @@ async function handleCommand(params: {
   ctx: InboundCtx;
   runtimeLogger: RuntimeLogger;
 }): Promise<void> {
-  const { command, handle, ctx, runtimeLogger } = params;
+  const { command, handle, runtimeLogger } = params;
   runtimeLogger.info("runtime.command_recv", {
     msg_id: command.eventId,
     command: command.command,
@@ -441,7 +470,11 @@ async function handleSessionCommand(
         const roomId = typeof command.args.room_id === "string" ? command.args.room_id : "";
         const title = typeof command.args.title === "string" ? command.args.title : "";
         if (!roomId || !title) {
-          return { command: command.command, ok: false, error: "session.rename needs room_id and title" };
+          return {
+            command: command.command,
+            ok: false,
+            error: "session.rename needs room_id and title",
+          };
         }
         await renameRoom(handle.client, roomId, title);
         return { command: command.command, ok: true, data: { room_id: roomId } };
@@ -473,7 +506,9 @@ async function handleInbound(params: {
 
   // Flow-B ack: send a read receipt as soon as we accept the message (text or
   // media), before the agent runs, so the delivered/read indicator lights up.
-  void handle.sendReadReceipt(message.roomId, message.eventId);
+  handle
+    .sendReadReceipt(message.roomId, message.eventId)
+    .catch((err: unknown) => report(err, "channel.sendReadReceipt"));
 
   // PROTOCOL C.5: a force_upgrade plugin must NOT relay messages. Reply once with
   // the upgrade notice and stop. Commands flow through onCommand, not here, so the
@@ -535,7 +570,13 @@ async function saveInboundMedia(
       ) => Promise<{ path: string; contentType?: string }>;
     };
     // maxBytes omitted → the store applies its own default cap.
-    const saved = await store.saveMediaBuffer(dl.buffer, dl.contentType, "inbound", undefined, dl.filename);
+    const saved = await store.saveMediaBuffer(
+      dl.buffer,
+      dl.contentType,
+      "inbound",
+      undefined,
+      dl.filename,
+    );
     return { path: saved.path, contentType: saved.contentType ?? dl.contentType };
   } catch (err) {
     runtimeLogger.info("runtime.media_download_error", { error: String(err) });
@@ -546,7 +587,7 @@ async function saveInboundMedia(
 async function dispatchToAgent(params: {
   message: MatrixInboundMessage;
   bodyText: string;
-  media?: { path: string; contentType?: string };
+  media?: { path: string; contentType?: string | undefined } | undefined;
   handle: MatrixClientHandle;
   ctx: InboundCtx;
   runtimeLogger: RuntimeLogger;
@@ -571,7 +612,10 @@ async function dispatchToAgent(params: {
     };
     session: {
       resolveStorePath: (store: string | undefined, opts: { agentId: string }) => string;
-      readSessionUpdatedAt?: (params: { storePath: string; sessionKey: string }) => number | undefined;
+      readSessionUpdatedAt?: (params: {
+        storePath: string;
+        sessionKey: string;
+      }) => number | undefined;
       recordInboundSession: (params: {
         storePath: string;
         sessionKey: string;
@@ -585,8 +629,8 @@ async function dispatchToAgent(params: {
         channel: string;
         from: string;
         body: string;
-        timestamp?: number;
-        previousTimestamp?: number;
+        timestamp?: number | undefined;
+        previousTimestamp?: number | undefined;
         envelope: unknown;
       }) => string;
       finalizeInboundContext: (ctx: Record<string, unknown>) => Record<string, unknown>;
@@ -613,10 +657,9 @@ async function dispatchToAgent(params: {
   const targetAgentId = boundSession?.agentId ?? route.agentId;
   const storePath =
     boundSession?.storePath ??
-    runtime.session.resolveStorePath(
-      (ctx.cfg as { session?: { store?: string } }).session?.store,
-      { agentId: targetAgentId },
-    );
+    runtime.session.resolveStorePath((ctx.cfg as { session?: { store?: string } }).session?.store, {
+      agentId: targetAgentId,
+    });
 
   const previousTimestamp = runtime.session.readSessionUpdatedAt?.({
     storePath,
@@ -669,18 +712,22 @@ async function dispatchToAgent(params: {
   });
 
   let lastTyping: boolean | undefined;
-  const setTyping = (on: boolean) => {
+  const setTyping = (on: boolean): void => {
     if (lastTyping === on) return;
     lastTyping = on;
-    void sendTyping(handle.client, roomId, on);
+    // Fire-and-forget; typing is best-effort, but route any failure to the sink.
+    sendTyping(handle.client, roomId, on).catch((err: unknown) => report(err, "channel.setTyping"));
   };
 
   // PROTOCOL E: coarse agent-status label as a cleartext state event (deduped).
   let lastStatus: AgentStatus | undefined;
-  const setStatus = (state: AgentStatus) => {
+  const setStatus = (state: AgentStatus): void => {
     if (lastStatus === state) return;
     lastStatus = state;
-    void sendAgentStatus(handle.client, roomId, state).catch(() => undefined);
+    // Fire-and-forget; status is best-effort, but route any failure to the sink.
+    sendAgentStatus(handle.client, roomId, state).catch((err: unknown) =>
+      report(err, "channel.setStatus"),
+    );
   };
 
   // PROTOCOL E: surface each tool invocation as ONE chat4000.tool event related
@@ -691,7 +738,14 @@ async function dispatchToAgent(params: {
   // (Verified against openclaw src/agents/embedded-agent-subscribe.handlers.tools.ts.)
   const tools = new Map<
     string,
-    { eventId: string; startTs: number; name: string; args: string; status: ToolStatus; result: string }
+    {
+      eventId: string;
+      startTs: number;
+      name: string;
+      args: string;
+      status: ToolStatus;
+      result: string;
+    }
   >();
   const onToolItem = async (item: ItemEventPayload): Promise<void> => {
     if (
@@ -803,22 +857,22 @@ async function dispatchToAgent(params: {
       },
     },
     replyOptions: {
-      onReasoningStream: async () => {
+      onReasoningStream: (): void => {
         setStatus("thinking");
         setTyping(true);
       },
-      onAssistantMessageStart: async () => {
+      onAssistantMessageStart: (): void => {
         setStatus("typing");
         setTyping(true);
       },
-      onPartialReply: async (payload: { text?: string }) => {
+      onPartialReply: (payload: { text?: string }): void => {
         const text = payload.text ?? "";
         if (!text) return;
         setStatus("typing");
         setTyping(true);
         draft.update(text);
       },
-      onToolStart: async () => {
+      onToolStart: (): void => {
         setStatus("working");
         setTyping(true);
       },

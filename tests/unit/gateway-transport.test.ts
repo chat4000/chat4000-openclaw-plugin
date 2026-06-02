@@ -41,6 +41,12 @@ class FakeWebSocket {
   }
 }
 
+/** Narrow a possibly-undefined lookup, failing the test if it's missing. */
+function defined<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("expected a value but found none");
+  return value;
+}
+
 const realWebSocket = globalThis.WebSocket;
 
 afterEach(() => {
@@ -57,7 +63,9 @@ async function connected(): Promise<{ transport: GatewayTransport; ws: FakeWebSo
   const connectP = transport.connect();
   const ws = FakeWebSocket.instances[0];
   ws.emit("open", {});
-  ws.emit("message", { data: JSON.stringify({ t: "auth_ok", user_id: "@plugin_x:hs", device_id: "D1" }) });
+  ws.emit("message", {
+    data: JSON.stringify({ t: "auth_ok", user_id: "@plugin_x:hs", device_id: "D1" }),
+  });
   await connectP;
   return { transport, ws };
 }
@@ -86,7 +94,12 @@ describe("GatewayTransport", () => {
     expect(req).toMatchObject({ t: "req", method: "GET", path: "/_matrix/client/v3/whoami" });
 
     ws.emit("message", {
-      data: JSON.stringify({ t: "resp", id: req!.id, status: 200, body: { user_id: "@plugin_x:hs" } }),
+      data: JSON.stringify({
+        t: "resp",
+        id: defined(req).id,
+        status: 200,
+        body: { user_id: "@plugin_x:hs" },
+      }),
     });
     const res = await respP;
     expect(res.status).toBe(200);
@@ -111,9 +124,11 @@ describe("GatewayTransport", () => {
 
   it("rejects an in-flight req when the socket closes", async () => {
     const { transport, ws } = await connected();
-    const respP = transport.fetch("https://gateway.chat4000.com/_matrix/client/v3/whoami", {
-      method: "GET",
-    }).catch((e: Error) => e);
+    const respP = transport
+      .fetch("https://gateway.chat4000.com/_matrix/client/v3/whoami", {
+        method: "GET",
+      })
+      .catch((e: Error) => e);
     ws.close();
     const err = await respP;
     expect(err).toBeInstanceOf(Error);
@@ -122,7 +137,7 @@ describe("GatewayTransport", () => {
   it("routes media paths to real HTTP, not the WS (PROTOCOL D.3)", async () => {
     const { transport, ws } = await connected();
     const realFetch = globalThis.fetch;
-    const mock = vi.fn(async () => new Response("bytes", { status: 200 }));
+    const mock = vi.fn(() => Promise.resolve(new Response("bytes", { status: 200 })));
     (globalThis as { fetch: unknown }).fetch = mock;
     try {
       const res = await transport.fetch(
@@ -140,7 +155,7 @@ describe("GatewayTransport", () => {
 
   it("flushes crypto + sync_acks a batch that carried to-device keys (PROTOCOL D.2)", async () => {
     (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
-    const flush = vi.fn(async () => undefined);
+    const flush = vi.fn(() => Promise.resolve(undefined));
     const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-pos-"));
     const posFile = path.join(dir, "pos.txt");
     try {
@@ -153,7 +168,9 @@ describe("GatewayTransport", () => {
       const connectP = transport.connect();
       const ws = FakeWebSocket.instances[0];
       ws.emit("open", {});
-      ws.emit("message", { data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }) });
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
       await connectP;
 
       const p1 = transport.slidingSyncRequest({ lists: {} });
@@ -184,7 +201,7 @@ describe("GatewayTransport", () => {
 
   it("sync_acks a keyless batch WITHOUT flushing crypto (PROTOCOL D.2)", async () => {
     (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
-    const flush = vi.fn(async () => undefined);
+    const flush = vi.fn(() => Promise.resolve(undefined));
     const transport = new GatewayTransport({
       gatewayUrl: "wss://gateway.chat4000.com/ws",
       accessToken: "syt",
@@ -193,7 +210,9 @@ describe("GatewayTransport", () => {
     const connectP = transport.connect();
     const ws = FakeWebSocket.instances[0];
     ws.emit("open", {});
-    ws.emit("message", { data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }) });
+    ws.emit("message", {
+      data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+    });
     await connectP;
 
     const p1 = transport.slidingSyncRequest({ lists: {} });
@@ -215,10 +234,13 @@ describe("GatewayTransport", () => {
     markPush("TXN42", false);
     void transport.fetch(
       "https://gateway.chat4000.com/_matrix/client/v3/rooms/!r:hs/send/m.room.encrypted/TXN42",
-      { method: "PUT", body: JSON.stringify({ algorithm: "m.megolm.v1.aes-sha2", ciphertext: "x" }) },
+      {
+        method: "PUT",
+        body: JSON.stringify({ algorithm: "m.megolm.v1.aes-sha2", ciphertext: "x" }),
+      },
     );
     await new Promise((r) => setTimeout(r, 0));
     const req = ws.frames().find((f) => f.t === "req");
-    expect((req!.body as Record<string, unknown>)["chat4000.push"]).toBe(false);
+    expect((defined(req).body as Record<string, unknown>)["chat4000.push"]).toBe(false);
   });
 });

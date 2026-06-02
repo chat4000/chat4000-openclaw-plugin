@@ -23,7 +23,6 @@ import {
   type MatrixClient,
   type MatrixEvent,
   MatrixEventEvent,
-  type Room,
   RoomEvent,
   SyncState,
 } from "matrix-js-sdk";
@@ -33,6 +32,7 @@ import {
   SlidingSync,
 } from "matrix-js-sdk/lib/sliding-sync.js";
 import { readPackageName, readPackageVersion } from "../package-info.js";
+import { report } from "../telemetry.js";
 import { pluginPlatform } from "../pairing/version-check.js";
 import { ensureDir, resolveChat4000AccountStateDir } from "../paths.js";
 import { GatewayTransport, gatewayToBaseUrl } from "./gateway-transport.js";
@@ -49,29 +49,36 @@ import {
   type MatrixInboundCommand,
   ROOM_KIND_STATE_EVENT,
 } from "./inbound.js";
-import type {
-  MatrixConnectionState,
-  MatrixCredentials,
-  MatrixInboundMessage,
-} from "./types.js";
+import type { MatrixConnectionState, MatrixCredentials, MatrixInboundMessage } from "./types.js";
+
+/** Read the `kind` field off a `chat4000.room_kind` state-event content. */
+function readRoomKind(content: unknown): string | undefined {
+  if (content && typeof content === "object") {
+    const kind = (content as { kind?: unknown }).kind;
+    if (typeof kind === "string") return kind;
+  }
+  return undefined;
+}
 
 export type MatrixClientHandleOptions = {
   accountId: string;
   credentials: MatrixCredentials;
   /** Release channel for the gateway auth identity (PROTOCOL D.1). */
-  releaseChannel?: string;
-  initialSyncLimit?: number;
-  abortSignal?: AbortSignal;
-  onConnectionState?: (state: MatrixConnectionState) => void;
-  onMessage?: (message: MatrixInboundMessage) => void;
+  releaseChannel?: string | undefined;
+  initialSyncLimit?: number | undefined;
+  abortSignal?: AbortSignal | undefined;
+  onConnectionState?: ((state: MatrixConnectionState) => void) | undefined;
+  onMessage?: ((message: MatrixInboundMessage) => void) | undefined;
   /** chat4000.command control events (PROTOCOL §5). */
-  onCommand?: (command: MatrixInboundCommand) => void;
-  log?: {
-    info?: (msg: string) => void;
-    warn?: (msg: string) => void;
-    error?: (msg: string) => void;
-    debug?: (msg: string) => void;
-  };
+  onCommand?: ((command: MatrixInboundCommand) => void) | undefined;
+  log?:
+    | {
+        info?: (msg: string) => void;
+        warn?: (msg: string) => void;
+        error?: (msg: string) => void;
+        debug?: (msg: string) => void;
+      }
+    | undefined;
 };
 
 /**
@@ -199,7 +206,10 @@ export class MatrixClientHandle {
     }
 
     const lists = new Map<string, MSC3575List>([
-      ["chat4000", { ranges: [[0, 99]], required_state: ALL_STATE, timeline_limit: SLIDING_TIMELINE_LIMIT }],
+      [
+        "chat4000",
+        { ranges: [[0, 99]], required_state: ALL_STATE, timeline_limit: SLIDING_TIMELINE_LIMIT },
+      ],
     ]);
     const roomSubscription: MSC3575RoomSubscription = {
       required_state: ALL_STATE,
@@ -266,7 +276,7 @@ export class MatrixClientHandle {
       }
     });
 
-    this.client.on(RoomEvent.Timeline, (event: MatrixEvent, _room: Room | undefined) => {
+    this.client.on(RoomEvent.Timeline, (event: MatrixEvent) => {
       this.handleTimelineEvent(event);
     });
 
@@ -277,17 +287,25 @@ export class MatrixClientHandle {
     await this.waitForInitialSync();
 
     // C2: periodically snapshot the crypto store so a restart keeps our keys.
-    this.persistTimer = setInterval(() => void this.persistCryptoStore(), IDB_PERSIST_INTERVAL_MS);
+    this.persistTimer = setInterval(() => {
+      this.persistCryptoStore().catch((err: unknown) => report(err, "matrix.persistCryptoStore"));
+    }, IDB_PERSIST_INTERVAL_MS);
     this.persistTimer.unref?.();
 
     if (this.opts.abortSignal) {
-      this.opts.abortSignal.addEventListener("abort", () => void this.stop(), { once: true });
+      this.opts.abortSignal.addEventListener(
+        "abort",
+        () => {
+          this.stop().catch((err: unknown) => report(err, "matrix.stop"));
+        },
+        { once: true },
+      );
     }
   }
 
   private waitForInitialSync(): Promise<void> {
     return new Promise<void>((resolve) => {
-      const onSync = (state: SyncState) => {
+      const onSync = (state: SyncState): void => {
         if (state === SyncState.Prepared || state === SyncState.Syncing) {
           this.client.off(ClientEvent.Sync, onSync);
           resolve();
@@ -303,7 +321,7 @@ export class MatrixClientHandle {
     // Only act on live messages, not paginated history.
     if (event.getTs() < this.startedAtTs) return;
 
-    const deliver = () => {
+    const deliver = (): void => {
       const command = decodeCommandEvent(event);
       if (command) {
         // PROTOCOL E (normative): a chat4000.command is honored ONLY in the
@@ -333,8 +351,7 @@ export class MatrixClientHandle {
     const room = this.client.getRoom(roomId);
     const stateEvent = room?.currentState.getStateEvents(ROOM_KIND_STATE_EVENT, "");
     if (!stateEvent) return false;
-    const kind = (stateEvent.getContent() as { kind?: string }).kind;
-    return kind === "control";
+    return readRoomKind(stateEvent.getContent()) === "control";
   }
 
   /** Best-effort: post a plain notice into the control room, if one exists. */
@@ -351,7 +368,7 @@ export class MatrixClientHandle {
   private findControlRoomId(): string | undefined {
     for (const room of this.client.getRooms()) {
       const stateEvent = room.currentState.getStateEvents(ROOM_KIND_STATE_EVENT, "");
-      if (stateEvent && (stateEvent.getContent() as { kind?: string }).kind === "control") {
+      if (stateEvent && readRoomKind(stateEvent.getContent()) === "control") {
         return room.roomId;
       }
     }
@@ -381,8 +398,9 @@ export class MatrixClientHandle {
     await this.persistCryptoStore();
     try {
       this.client.stopClient();
-    } catch {
-      // best-effort
+    } catch (err) {
+      // Shutdown is best-effort, but an unexpected stop failure still goes to the sink.
+      report(err, "matrix.stopClient");
     }
     this.transport.dispose();
     this.opts.onConnectionState?.("disconnected");

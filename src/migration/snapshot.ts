@@ -31,7 +31,10 @@ export function createV1MigrationSnapshot(params: {
   accountId: string;
   paths: string[];
 }): SnapshotResult {
-  const archiveDir = path.join(snapshotRoot(), `chat4000-v1-${params.accountId}-${timestampSlug()}`);
+  const archiveDir = path.join(
+    snapshotRoot(),
+    `chat4000-v1-${params.accountId}-${timestampSlug()}`,
+  );
   const copied: string[] = [];
   try {
     mkdirSync(archiveDir, { recursive: true });

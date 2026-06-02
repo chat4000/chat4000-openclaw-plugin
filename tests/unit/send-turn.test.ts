@@ -7,19 +7,22 @@ import {
   sendTurnAnchor,
 } from "../../src/matrix/send.js";
 
-function mockClient() {
-  const sent: { type: string; content: Record<string, unknown> }[] = [];
-  const state: { type: string; content: Record<string, unknown>; stateKey: string }[] = [];
+type SentEvent = { type: string; content: Record<string, unknown> };
+type SentState = { type: string; content: Record<string, unknown>; stateKey: string };
+
+function mockClient(): { client: MatrixClient; sent: SentEvent[]; state: SentState[] } {
+  const sent: SentEvent[] = [];
+  const state: SentState[] = [];
   const client = {
     makeTxnId: () => `txn-${sent.length + 1}`,
-    sendEvent: vi.fn(async (_roomId: string, type: string, content: Record<string, unknown>) => {
+    sendEvent: vi.fn((_roomId: string, type: string, content: Record<string, unknown>) => {
       sent.push({ type, content });
-      return { event_id: `$ev${sent.length}` };
+      return Promise.resolve({ event_id: `$ev${sent.length}` });
     }),
     sendStateEvent: vi.fn(
-      async (_roomId: string, type: string, content: Record<string, unknown>, stateKey: string) => {
+      (_roomId: string, type: string, content: Record<string, unknown>, stateKey: string) => {
         state.push({ type, content, stateKey });
-        return { event_id: "$st" };
+        return Promise.resolve({ event_id: "$st" });
       },
     ),
   } as unknown as MatrixClient;
@@ -58,13 +61,14 @@ describe("turn / tool / status sends (PROTOCOL E)", () => {
       duration_ms: 5,
     });
     const c = m.sent[0].content;
-    expect((c["m.relates_to"] as { rel_type: string; event_id: string })).toEqual({
+    expect(c["m.relates_to"] as { rel_type: string; event_id: string }).toEqual({
       rel_type: "m.replace",
       event_id: "$tool",
     });
-    expect(((c["m.new_content"] as Record<string, unknown>)["chat4000.tool"] as { status: string }).status).toBe(
-      "done",
-    );
+    expect(
+      ((c["m.new_content"] as Record<string, unknown>)["chat4000.tool"] as { status: string })
+        .status,
+    ).toBe("done");
   });
 
   it("sendAgentStatus writes a cleartext chat4000.status state event", async () => {

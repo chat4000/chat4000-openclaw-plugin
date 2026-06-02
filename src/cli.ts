@@ -24,7 +24,23 @@ import { detectV1State } from "./migration/detect.js";
 import { runChat4000Migration } from "./migration/migrate.js";
 import { applyUpdate } from "./update/apply.js";
 import { checkUpdatePreflight, formatPreflight } from "./update/preflight.js";
-import { captureChat4000TestException, getTelemetryStatus, setTelemetryEnabled } from "./telemetry.js";
+import {
+  captureChat4000TestException,
+  getTelemetryStatus,
+  setTelemetryEnabled,
+} from "./telemetry.js";
+
+/**
+ * Minimal structural view of the Commander `Command` the host passes in. Only
+ * the chainable methods this CLI uses are declared; each returns a `CliCommand`
+ * so the builder chains stay fully typed (no `any` at the call sites).
+ */
+type CliCommand = {
+  command: (name: string, opts?: { hidden?: boolean }) => CliCommand;
+  description: (text: string) => CliCommand;
+  option: (flags: string, description?: string, defaultValue?: string) => CliCommand;
+  action: <A extends unknown[]>(handler: (...args: A) => void | Promise<void>) => CliCommand;
+};
 
 type PluginApiLike = {
   config?: Record<string, unknown>;
@@ -36,8 +52,15 @@ type PluginApiLike = {
     };
   };
   registerCli?: (
-    registrar: (ctx: { program: any; config: Record<string, unknown>; workspaceDir?: string }) => void,
-    opts?: { commands?: string[]; descriptors?: Array<{ name: string; description: string; hasSubcommands: boolean }> },
+    registrar: (ctx: {
+      program: CliCommand;
+      config: Record<string, unknown>;
+      workspaceDir?: string;
+    }) => void,
+    opts?: {
+      commands?: string[];
+      descriptors?: Array<{ name: string; description: string; hasSubcommands: boolean }>;
+    },
   ) => void;
 };
 
@@ -60,8 +83,8 @@ type SetupCommandOptions = {
 
 type PairCommandOptions = {
   account?: string;
-  env?: string;
-  stage?: boolean;
+  env?: string | undefined;
+  stage?: boolean | undefined;
   registrarUrl?: string;
   serviceToken?: string;
   ttl?: string;
@@ -136,10 +159,10 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .command("status")
         .description("Show current chat4000 channel status")
         .option("--account <id>", "Account id", "default")
-        .action(async (opts: { account?: string }) => {
+        .action((opts: { account?: string }) => {
           const cfg = loadConfig(api);
           const account = resolveChat4000Account({
-            cfg: cfg as { channels?: Record<string, unknown> },
+            cfg,
             accountId: opts.account,
           });
           const v1 = detectV1State(account.accountId);
@@ -153,7 +176,9 @@ export function registerChat4000Cli(api: PluginApiLike): void {
               `credential source: ${account.credentialSource}`,
               `registrar: ${account.provisioning.url ?? "(unset)"}`,
               `configured: ${account.configured ? "yes" : "no"}`,
-              ...(v1.present ? ['⚠ legacy v1 state detected — run "openclaw chat4000 migrate"'] : []),
+              ...(v1.present
+                ? ['⚠ legacy v1 state detected — run "openclaw chat4000 migrate"']
+                : []),
             ].join("\n") + "\n",
           );
         });
@@ -186,9 +211,11 @@ export function registerChat4000Cli(api: PluginApiLike): void {
 
       chat4000
         .command("reset")
-        .description("Wipe local Matrix credentials + crypto/sync state for an account. Re-run setup after.")
+        .description(
+          "Wipe local Matrix credentials + crypto/sync state for an account. Re-run setup after.",
+        )
         .option("--account <id>", "Account id", "default")
-        .action(async (opts: { account?: string }) => {
+        .action((opts: { account?: string }) => {
           runReset(opts.account);
         });
 
@@ -201,8 +228,8 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .description("List recent OpenClaw sessions that chat4000 can join")
         .option("--account <id>", "Account id", "default")
         .option("--limit <n>", "Max sessions to show", "20")
-        .action(async (opts: { account?: string; limit?: string }) => {
-          await runListSessions(api, opts).catch(handleCliError);
+        .action((opts: { account?: string; limit?: string }) => {
+          runSessionAction(() => runListSessions(api, opts));
         });
 
       sessions
@@ -211,8 +238,8 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .option("--account <id>", "Account id", "default")
         .option("--room <roomId>", "Matrix room id (e.g. !abc:chat4000.com)")
         .option("--session-key <value>", "Existing OpenClaw session key to join")
-        .action(async (opts: SessionBindingOptions) => {
-          await runBindSession(api, opts).catch(handleCliError);
+        .action((opts: SessionBindingOptions) => {
+          runSessionAction(() => runBindSession(api, opts));
         });
 
       sessions
@@ -220,8 +247,8 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .description("Show the chat4000 session binding for a room")
         .option("--account <id>", "Account id", "default")
         .option("--room <roomId>", "Matrix room id")
-        .action(async (opts: SessionBindingOptions) => {
-          await runShowBinding(api, opts).catch(handleCliError);
+        .action((opts: SessionBindingOptions) => {
+          runSessionAction(() => runShowBinding(api, opts));
         });
 
       sessions
@@ -229,8 +256,8 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .description("Clear the chat4000 session binding for a room")
         .option("--account <id>", "Account id", "default")
         .option("--room <roomId>", "Matrix room id")
-        .action(async (opts: SessionBindingOptions) => {
-          await runClearBinding(api, opts).catch(handleCliError);
+        .action((opts: SessionBindingOptions) => {
+          runSessionAction(() => runClearBinding(api, opts));
         });
 
       const telemetry = chat4000
@@ -274,7 +301,9 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .description("Send a test exception to Sentry")
         .action(async () => {
           const sent = await captureChat4000TestException();
-          output.write(sent ? "Telemetry test exception sent.\n" : "Telemetry test exception not sent.\n");
+          output.write(
+            sent ? "Telemetry test exception sent.\n" : "Telemetry test exception not sent.\n",
+          );
         });
     },
     {
@@ -293,11 +322,11 @@ export function registerChat4000Cli(api: PluginApiLike): void {
 // ─── Endpoint resolution (env preset + overrides) ────────────────────────────
 
 type EndpointOpts = {
-  env?: string;
-  stage?: boolean;
-  registrarUrl?: string;
-  serviceToken?: string;
-  gatewayUrl?: string;
+  env?: string | undefined;
+  stage?: boolean | undefined;
+  registrarUrl?: string | undefined;
+  serviceToken?: string | undefined;
+  gatewayUrl?: string | undefined;
 };
 
 function resolveSelectedEnv(opts: EndpointOpts): Chat4000Env {
@@ -356,7 +385,7 @@ async function enforceVersionBeforePrivileged(
 async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<void> {
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   const env = resolveSelectedEnv(opts);
@@ -414,7 +443,8 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
     gatewayUrl: credentials.gatewayUrl,
     userId: credentials.userId,
     deviceId: credentials.deviceId,
-    registrarUrl: opts.registrarUrl?.trim() || account.provisioning.url || endpointsForEnv(env).registrar,
+    registrarUrl:
+      opts.registrarUrl?.trim() || account.provisioning.url || endpointsForEnv(env).registrar,
   });
   output.write("✓ Saved chat4000 channel config.\n");
 
@@ -428,7 +458,7 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
 async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<void> {
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   if (!account.configured) {
@@ -501,13 +531,15 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
       // transient; keep polling
     }
   }
-  output.write('Pairing window elapsed. If the device didn\'t join, re-run "openclaw chat4000 pair".\n');
+  output.write(
+    'Pairing window elapsed. If the device didn\'t join, re-run "openclaw chat4000 pair".\n',
+  );
 }
 
 async function runMigrate(api: PluginApiLike, opts: MigrateCommandOptions): Promise<void> {
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   const env = resolveSelectedEnv(opts);
@@ -582,7 +614,7 @@ async function runUpdate(opts: UpdateCommandOptions): Promise<void> {
       `  to:   ${result.toVersion ?? "(unknown)"}`,
       `  ${result.reason ?? ""}`,
       ...(result.ok && !result.restartScheduled
-        ? ['  Restart the gateway to load it (or re-run with --restart).']
+        ? ["  Restart the gateway to load it (or re-run with --restart)."]
         : []),
     ].join("\n") + "\n",
   );
@@ -609,10 +641,7 @@ function runReset(accountArg?: string): void {
   output.write('Re-provision with: "openclaw chat4000 setup"\n');
 }
 
-async function runListSessions(
-  api: PluginApiLike,
-  opts: { account?: string; limit?: string },
-): Promise<void> {
+function runListSessions(api: PluginApiLike, opts: { account?: string; limit?: string }): void {
   const cfg = loadConfig(api);
   const limit = Math.max(1, Number.parseInt(opts.limit ?? "20", 10) || 20);
   const sessions = listOpenClawSessionCandidates(cfg).slice(0, limit);
@@ -634,14 +663,14 @@ async function runListSessions(
   );
 }
 
-async function runBindSession(api: PluginApiLike, opts: SessionBindingOptions): Promise<void> {
+function runBindSession(api: PluginApiLike, opts: SessionBindingOptions): void {
   const room = opts.room?.trim();
   const sessionKey = opts.sessionKey?.trim();
   if (!room) throw new Error("missing --room <roomId>");
   if (!sessionKey) throw new Error("missing --session-key <value>");
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   const candidate = findOpenClawSessionCandidate(sessionKey, cfg);
@@ -651,15 +680,17 @@ async function runBindSession(api: PluginApiLike, opts: SessionBindingOptions): 
     groupId: room,
     target: candidate,
   });
-  output.write(`Bound chat4000 room ${room} to ${binding.targetSessionKey} (agent ${binding.agentId}).\n`);
+  output.write(
+    `Bound chat4000 room ${room} to ${binding.targetSessionKey} (agent ${binding.agentId}).\n`,
+  );
 }
 
-async function runShowBinding(api: PluginApiLike, opts: SessionBindingOptions): Promise<void> {
+function runShowBinding(api: PluginApiLike, opts: SessionBindingOptions): void {
   const room = opts.room?.trim();
   if (!room) throw new Error("missing --room <roomId>");
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   const binding = getChat4000SessionBinding({ accountId: account.accountId, groupId: room });
@@ -677,16 +708,18 @@ async function runShowBinding(api: PluginApiLike, opts: SessionBindingOptions): 
   );
 }
 
-async function runClearBinding(api: PluginApiLike, opts: SessionBindingOptions): Promise<void> {
+function runClearBinding(api: PluginApiLike, opts: SessionBindingOptions): void {
   const room = opts.room?.trim();
   if (!room) throw new Error("missing --room <roomId>");
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
-    cfg: cfg as { channels?: Record<string, unknown> },
+    cfg,
     accountId: opts.account,
   });
   const cleared = clearChat4000SessionBinding({ accountId: account.accountId, groupId: room });
-  output.write(cleared ? "Cleared chat4000 room binding.\n" : "No binding was set for that room.\n");
+  output.write(
+    cleared ? "Cleared chat4000 room binding.\n" : "No binding was set for that room.\n",
+  );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -703,10 +736,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function writeChannelConfig(
-  api: PluginApiLike,
-  params: ChannelConfigParams,
-): Promise<void> {
+async function writeChannelConfig(api: PluginApiLike, params: ChannelConfigParams): Promise<void> {
   const current = loadConfig(api);
   const next = patchChannelConfig(current, params);
   if (api.runtime?.config?.writeConfigFile) {
@@ -743,7 +773,9 @@ export function patchChannelConfig(
     ? plugins.allow.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
     : undefined;
   if (currentAllow) {
-    plugins.allow = currentAllow.includes("chat4000") ? currentAllow : [...currentAllow, "chat4000"];
+    plugins.allow = currentAllow.includes("chat4000")
+      ? currentAllow
+      : [...currentAllow, "chat4000"];
   }
 
   // Note: accessToken stays in the 0600 credentials file, NOT in config.
@@ -774,6 +806,15 @@ export function patchChannelConfig(
 
   channels.chat4000 = currentChannel;
   return { ...cfg, channels, plugins };
+}
+
+/** Run a synchronous CLI action, routing any thrown error to the CLI sink. */
+function runSessionAction(action: () => void): void {
+  try {
+    action();
+  } catch (error) {
+    handleCliError(error);
+  }
 }
 
 function handleCliError(error: unknown): void {

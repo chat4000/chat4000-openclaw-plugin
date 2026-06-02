@@ -17,7 +17,7 @@ export type MatrixCredentials = {
   accessToken: string;
   deviceId: string;
   /** Plugin bot id from the provisioning service (stable across logins). */
-  pluginId?: string;
+  pluginId?: string | undefined;
 };
 
 /** Connection lifecycle surfaced to the channel layer. */
@@ -35,7 +35,7 @@ export type MatrixInboundMessage = {
   roomId: string;
   /** Matrix user id of the sender. */
   senderId: string;
-  senderDisplayName?: string;
+  senderDisplayName?: string | undefined;
   /** Origin server timestamp (ms). */
   ts: number;
   body:

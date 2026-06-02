@@ -1,0 +1,9 @@
+dist
+node_modules
+*.generated.ts
+package-lock.json
+
+# Prose docs are not owned by the code formatter (out of scope for this config).
+*.md
+docs/
+scripts/

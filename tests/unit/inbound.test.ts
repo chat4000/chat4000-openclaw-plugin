@@ -3,7 +3,10 @@ import type { MatrixEvent } from "matrix-js-sdk";
 import { decodeCommandEvent, decodeInboundEvent } from "../../src/matrix/inbound.js";
 
 /** Build a fake MatrixEvent exposing just the accessors the decoders use. */
-function fakeEvent(content: Record<string, unknown>, opts?: { type?: string; redacted?: boolean }): MatrixEvent {
+function fakeEvent(
+  content: Record<string, unknown>,
+  opts?: { type?: string; redacted?: boolean },
+): MatrixEvent {
   return {
     getType: () => opts?.type ?? "m.room.message",
     isRedacted: () => opts?.redacted ?? false,
@@ -41,7 +44,9 @@ describe("inbound decoding", () => {
   });
 
   it("ignores redacted events", () => {
-    expect(decodeInboundEvent(fakeEvent({ msgtype: "m.text", body: "x" }, { redacted: true }))).toBeNull();
+    expect(
+      decodeInboundEvent(fakeEvent({ msgtype: "m.text", body: "x" }, { redacted: true })),
+    ).toBeNull();
   });
 
   it("surfaces an image as a media body carrying the raw content (PROTOCOL D.3)", () => {

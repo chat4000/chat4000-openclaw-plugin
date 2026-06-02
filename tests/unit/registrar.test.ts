@@ -1,14 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
-import { RegistrarClient, RegistrarError, generatePairingCode } from "../../src/pairing/registrar.js";
+import {
+  RegistrarClient,
+  RegistrarError,
+  generatePairingCode,
+} from "../../src/pairing/registrar.js";
 
-function mockFetch(handler: (url: string, init: RequestInit) => { status: number; body: unknown }) {
-  return vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-    const { status, body } = handler(String(url), init ?? {});
-    return new Response(JSON.stringify(body), {
-      status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }) as unknown as typeof fetch;
+/** The request body in these tests is always a JSON string we set ourselves. */
+function bodyText(body: BodyInit | null | undefined): string {
+  if (typeof body !== "string") throw new Error("expected a string request body");
+  return body;
+}
+
+function urlOf(input: string | URL | Request): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
+function mockFetch(
+  handler: (url: string, init: RequestInit) => { status: number; body: unknown },
+): typeof fetch {
+  return vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    const { status, body } = handler(urlOf(input), init ?? {});
+    return Promise.resolve(
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+  });
 }
 
 describe("RegistrarClient", () => {
@@ -23,12 +43,18 @@ describe("RegistrarClient", () => {
       }),
     });
 
-    const res = await client.registerPairing({ code: "ABC-123", pluginId: "plugin-uuid", ttlSeconds: 300 });
+    const res = await client.registerPairing({
+      code: "ABC-123",
+      pluginId: "plugin-uuid",
+      ttlSeconds: 300,
+    });
 
     expect(res).toEqual({ ok: true, expiresAt: 1700000000000 });
     expect(captured?.url).toBe("https://registrar.chat4000.com/pair/register");
-    expect((captured?.init.headers as Record<string, string>).Authorization).toBe("Bearer svc-token");
-    expect(JSON.parse(String(captured?.init.body))).toMatchObject({
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer svc-token",
+    );
+    expect(JSON.parse(bodyText(captured?.init.body))).toMatchObject({
       code: "ABC-123",
       plugin_id: "plugin-uuid",
       ttl_seconds: 300,
@@ -83,7 +109,10 @@ describe("RegistrarClient", () => {
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
       serviceToken: "svc-token",
-      fetchImpl: mockFetch(() => ({ status: 409, body: { errcode: "M_IN_USE", error: "code already in use" } })),
+      fetchImpl: mockFetch(() => ({
+        status: 409,
+        body: { errcode: "M_IN_USE", error: "code already in use" },
+      })),
     });
 
     const err = await client.registerPairing({ code: "x", pluginId: "p" }).catch((e) => e);
@@ -131,7 +160,7 @@ describe("RegistrarClient", () => {
     expect(captured?.url).toBe("https://registrar.chat4000.com/version");
     // Public endpoint — no bearer token.
     expect((captured?.init.headers as Record<string, string>).Authorization).toBeUndefined();
-    expect(JSON.parse(String(captured?.init.body))).toMatchObject({
+    expect(JSON.parse(bodyText(captured?.init.body))).toMatchObject({
       app_id: "@chat4000/openclaw-plugin",
       client_version: "1.9.0",
       release_channel: "stage",

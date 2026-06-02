@@ -8,7 +8,7 @@ import type {
 type ChannelConfigInput = { channels?: Record<string, unknown> } | undefined;
 
 function getChannelConfig(cfg: ChannelConfigInput): Chat4000Config {
-  return ((cfg ?? {}).channels?.["chat4000"] ?? {}) as Chat4000Config;
+  return (cfg ?? {}).channels?.["chat4000"] ?? {};
 }
 
 export function listChat4000AccountIds(cfg: ChannelConfigInput): string[] {
@@ -55,8 +55,8 @@ function resolveProvisioning(merged: Chat4000Config): Chat4000ProvisioningConfig
  * credentials file written by `setup`/`pair`.
  */
 export function resolveChat4000Account(params: {
-  cfg?: { channels?: Record<string, unknown> };
-  accountId?: string | null;
+  cfg?: { channels?: Record<string, unknown> } | undefined;
+  accountId?: string | null | undefined;
 }): ResolvedChat4000Account {
   const channelConfig = getChannelConfig(params.cfg);
   const accountId = params.accountId ?? getDefaultChat4000AccountId(params.cfg);

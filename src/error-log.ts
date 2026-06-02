@@ -8,7 +8,7 @@ function resolveChat4000LogDir(): string {
   return path.join(resolveOpenClawHome(), "plugins", "chat4000", "logs");
 }
 
-export function resolveChat4000ErrorLogPath(): string {
+function resolveChat4000ErrorLogPath(): string {
   return path.join(resolveChat4000LogDir(), "errors.log");
 }
 
@@ -20,16 +20,14 @@ export function dumpChat4000Trace(
   captureChat4000Exception(error, scope);
 
   const logPath = resolveChat4000ErrorLogPath();
-  const detail = error instanceof Error
-    ? error
-    : new Error(typeof error === "string" ? error : JSON.stringify(error));
+  const detail =
+    error instanceof Error
+      ? error
+      : new Error(typeof error === "string" ? error : JSON.stringify(error));
 
   mkdirSync(path.dirname(logPath), { recursive: true });
 
-  const lines = [
-    `=== ${new Date().toISOString()} [${scope}] ===`,
-    `message: ${detail.message}`,
-  ];
+  const lines = [`=== ${new Date().toISOString()} [${scope}] ===`, `message: ${detail.message}`];
 
   if (context && Object.keys(context).length > 0) {
     lines.push(`context: ${JSON.stringify(context)}`);

@@ -1,6 +1,6 @@
 import { renameSync, statSync, unlinkSync } from "node:fs";
 
-export const CHAT4000_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const CHAT4000_LOG_MAX_BYTES = 10 * 1024 * 1024;
 
 export function rotateLogIfOversized(
   logPath: string,

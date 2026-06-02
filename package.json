@@ -19,6 +19,10 @@
     "publish:npm": "python3.12 scripts/publish_npm.py",
     "publish:npm:dry-run": "python3.12 scripts/publish_npm.py --dry-run",
     "build": "tsc",
+    "lint": "eslint .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && eslint . && prettier --check . && knip",
     "test": "vitest run --project unit",
     "test:contract": "vitest run --project contract",
     "test:all": "vitest run",
@@ -27,7 +31,12 @@
   "devDependencies": {
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-neverthrow": "^1.1.4",
+    "knip": "^6.15.0",
+    "prettier": "^3.8.3",
     "typescript": "^5.7.0",
+    "typescript-eslint": "^8.60.1",
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
@@ -59,6 +68,7 @@
     "markdown-it": "^14.1.0",
     "matrix-encrypt-attachment": "^1.0.3",
     "matrix-js-sdk": "^41.6.0",
+    "neverthrow": "^8.2.0",
     "qrcode-terminal": "^0.12.0"
   },
   "engines": {
