@@ -12,7 +12,7 @@
 import MarkdownIt from "markdown-it";
 import { EventType, type MatrixClient, MsgType, RelationType } from "matrix-js-sdk";
 import { markPush } from "./push-registry.js";
-import { sendCustomStateEvent, sendTimelineEvent } from "./sdk-boundary.js";
+import { sendTimelineEvent } from "./sdk-boundary.js";
 
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true });
 
@@ -107,7 +107,7 @@ export async function sendCommandResult(
   return sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
-// ── Turn anchoring, tool calls, agent status (PROTOCOL E) ────────────────────
+// ── Turn anchoring, tool calls (PROTOCOL E) ──────────────────────────────────
 
 /**
  * Encrypted field that ties a turn event to its anchor message (PROTOCOL E).
@@ -116,6 +116,8 @@ export async function sendCommandResult(
  */
 const TURN_ID_FIELD = "chat4000.turn_id";
 const TOOL_MSGTYPE = "chat4000.tool";
+/** Custom timeline event type for the live-activity label (protocol e3d9358). */
+const STATUS_EVENT_TYPE = "chat4000.status";
 
 export type ToolPayload = {
   tool_id: string;
@@ -177,29 +179,53 @@ export async function editToolEnd(
   await sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
 }
 
+export type AgentStatusState = "thinking" | "working" | "typing" | "idle";
+
 /**
- * Publish the coarse agent activity label as a cleartext state event
- * (PROTOCOL E). State events are not E2EE in Matrix — this carries only an
- * activity word, no message content. Overwrites on each transition.
+ * Publish the coarse live-activity label as a `chat4000.status` event sent into
+ * the timeline (PROTOCOL E, protocol e3d9358). It is an ordinary E2EE-encrypted
+ * timeline event — the homeserver never sees the `state` word.
+ *
+ * It references the **question** (the user's prompt `event_id`), not the answer
+ * anchor: the question always exists before the turn starts, so even the first
+ * `thinking` has a stable target. `m.relates_to` is left in cleartext on purpose
+ * (the SDK hoists it) so the client can group status under the question's turn —
+ * the server sees only *that* a status references the question.
+ *
+ * Each call is a FRESH event — never an edit/overwrite. The caller sends on every
+ * state transition and re-sends every 4s as a keep-alive (shorter than the
+ * client's 10s TTL), and always sends `idle` at turn end. Never wakes the user.
  */
 export async function sendAgentStatus(
   client: MatrixClient,
   roomId: string,
-  state: "thinking" | "working" | "typing" | "idle",
+  state: AgentStatusState,
+  questionEventId: string,
 ): Promise<void> {
-  await sendCustomStateEvent(client, roomId, "chat4000.status", { state }, "");
+  const content: MatrixContent = {
+    state,
+    "m.relates_to": { rel_type: RelationType.Reference, event_id: questionEventId },
+  };
+  const txnId = client.makeTxnId();
+  markPush(txnId, false);
+  await sendTimelineEvent(client, roomId, STATUS_EVENT_TYPE, content, txnId);
 }
 
-/** Send a typing indicator (ephemeral, best-effort). */
-export async function sendTyping(
+/** Custom timeline event type for the HTML-card final answer (PROTOCOL E). */
+const HTML_CARD_EVENT_TYPE = "chat4000.html_card";
+
+/**
+ * Send a complete HTML card as the turn's final answer (PROTOCOL E, the
+ * `final_card` tool). The decrypted event is exactly
+ * `{type:"chat4000.html_card", content:{html}}` — no msgtype/body/edit. It
+ * pushes, because the card is the sole final-answer surface for that turn.
+ */
+export async function sendHtmlCard(
   client: MatrixClient,
   roomId: string,
-  typing: boolean,
-  timeoutMs = 20_000,
-): Promise<void> {
-  try {
-    await client.sendTyping(roomId, typing, typing ? timeoutMs : 0);
-  } catch {
-    // Typing is best-effort.
-  }
+  html: string,
+): Promise<string> {
+  const txnId = client.makeTxnId();
+  markPush(txnId, true);
+  return sendTimelineEvent(client, roomId, HTML_CARD_EVENT_TYPE, { html }, txnId);
 }

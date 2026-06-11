@@ -9,6 +9,7 @@
  *   - `ok` → nothing.
  */
 import { readPackageName, readPackageVersion } from "../package-info.js";
+import { machineClientId } from "../analytics.js";
 import type { RegistrarClient, VersionPolicyResult } from "./registrar.js";
 
 /** Map the Node platform to the policy's platform label (analytics only). */
@@ -35,6 +36,7 @@ export async function checkPluginVersion(params: {
     clientVersion: readPackageVersion(),
     releaseChannel: params.releaseChannel?.trim() || "dev",
     platform: pluginPlatform(),
+    clientId: machineClientId(), // PL3: X-Client-Id = agent_install_id (null when telemetry off)
   });
 }
 

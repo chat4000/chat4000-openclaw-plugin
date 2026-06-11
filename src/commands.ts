@@ -73,6 +73,7 @@ export async function handleControlCommand(
           targetVersion,
           restart,
           force: cmd.args.force === true,
+          trigger: "command", // PL2
           log: ctx.log,
         });
         return {

@@ -29,6 +29,7 @@ import {
   getTelemetryStatus,
   setTelemetryEnabled,
 } from "./telemetry.js";
+import { flushAnalytics, registerPairedClientId, track } from "./analytics.js";
 
 /**
  * Minimal structural view of the Commander `Command` the host passes in. Only
@@ -486,6 +487,15 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
     try {
       const status = await client.getPairingStatus(pairing.code);
       if (status.status === "completed") {
+        // PL4 / FLW2-4: the registrar hands us the redeeming phone's client_id —
+        // emit the machine↔phone join event and register the super property
+        // (latest pairing wins). Absent on old registrars / telemetry-off phones.
+        const pairedClientId = status.clientId?.trim();
+        if (pairedClientId) registerPairedClientId(pairedClientId);
+        // PL4: the canonical prop is paired_client_id only (absent on old
+        // registrars / telemetry-off phones; the event still counts the join).
+        track("pairing_completed", pairedClientId ? { paired_client_id: pairedClientId } : {});
+        await flushAnalytics();
         output.write(`✓ Device paired${status.userId ? ` (${status.userId})` : ""}.\n`);
         // PROTOCOL C.3 + E: on completion the plugin invites the user into its
         // control room + space (created by the gateway). If the gateway hasn't
@@ -599,6 +609,7 @@ async function runUpdate(opts: UpdateCommandOptions): Promise<void> {
     targetVersion: opts.version?.trim() || undefined,
     force: opts.force === true,
     restart: opts.restart === true,
+    trigger: "command", // PL2
     log: (line) => output.write(`${line}\n`),
   });
 

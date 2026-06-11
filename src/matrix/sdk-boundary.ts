@@ -5,7 +5,7 @@
  * The SDK types `sendEvent` / `sendStateEvent` as `content: TimelineEvents[K]` /
  * `StateEvents[K]` — closed unions keyed off the *known* event types. chat4000
  * legitimately sends custom msgtypes (`chat4000.tool`, `chat4000.command_result`,
- * `chat4000.status`, `m.space.child/parent`, `chat4000.room_kind`) and
+ * `m.space.child/parent`, `chat4000.room_kind`) and
  * `m.replace` edits with arbitrary `m.new_content`, none of which the generated
  * union can express. Rather than scatter `as any` across the send layer, every
  * such call funnels through these three wrappers, where the one unavoidable
@@ -18,17 +18,22 @@ import { type EventType, type MatrixClient } from "matrix-js-sdk";
 /** Content we hand to the SDK: a plain JSON object (always with `body`/`msgtype`). */
 export type MatrixSendContent = Record<string, unknown>;
 
-/** Send a timeline event with chat4000's custom/dynamic content. */
+/**
+ * Send a timeline event with chat4000's custom/dynamic content. `eventType`
+ * accepts a custom string type (e.g. `chat4000.status`) as well as a known
+ * `EventType` — both are encrypted into `m.room.encrypted` for an E2EE room.
+ */
 export async function sendTimelineEvent(
   client: MatrixClient,
   roomId: string,
-  eventType: EventType,
+  eventType: EventType | string,
   content: MatrixSendContent,
   txnId: string,
 ): Promise<string> {
-  // SDK-union limitation: `sendEvent<K>` types `content` as `TimelineEvents[K]`,
-  // which cannot express chat4000's custom msgtypes / `m.new_content` edits.
-  // @ts-expect-error -- content union is narrower than the wire format; see module doc.
+  // SDK-union limitation: `sendEvent<K>` types both the event type and `content`
+  // (as `TimelineEvents[K]`) off a closed union, which cannot express chat4000's
+  // custom event types / msgtypes / `m.new_content` edits.
+  // @ts-expect-error -- type+content union is narrower than the wire format; see module doc.
   const res = await client.sendEvent(roomId, eventType, content, txnId);
   return res.event_id;
 }
@@ -43,7 +48,7 @@ export async function sendCustomStateEvent(
 ): Promise<string> {
   // SDK-union limitation: `sendStateEvent<K extends keyof StateEvents>` only
   // accepts known state-event types; chat4000 uses custom ones (room_kind,
-  // m.space.child/parent, chat4000.status). The runtime call is a plain C-S PUT.
+  // m.space.child/parent). The runtime call is a plain C-S PUT.
   // @ts-expect-error -- custom state-event type is outside the SDK's StateEvents union; see module doc.
   const res = await client.sendStateEvent(roomId, type, content, stateKey);
   return res.event_id;

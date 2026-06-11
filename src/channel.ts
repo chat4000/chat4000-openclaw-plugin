@@ -23,18 +23,19 @@ import { getHandle, registerHandle, unregisterHandle } from "./channel-runtime.j
 import { MatrixClientHandle } from "./matrix/client.js";
 import type { MatrixInboundCommand } from "./matrix/inbound.js";
 import {
+  type AgentStatusState,
   editToolEnd,
   sendAgentStatus,
   sendCommandResult,
   sendText as matrixSendText,
   sendToolStart,
-  sendTyping,
 } from "./matrix/send.js";
 import { MatrixDraftStream } from "./matrix/streaming.js";
 import type { MatrixInboundMessage } from "./matrix/types.js";
 import { type CommandResult, handleControlCommand } from "./commands.js";
 import { downloadInboundMediaBuffer, roomIsEncrypted, sendMediaMessage } from "./matrix/media.js";
-import { archiveRoom, createSessionRoom, renameRoom } from "./matrix/space.js";
+import { archiveRoom, createSessionRoom, deleteSessionRoom, renameRoom } from "./matrix/space.js";
+import { clearCardFinalized, consumeCardFinalized } from "./matrix/card-finalize.js";
 import { readPackageVersion } from "./package-info.js";
 import { RegistrarClient } from "./pairing/registrar.js";
 import { checkPluginVersion, formatVersionNotice } from "./pairing/version-check.js";
@@ -43,7 +44,14 @@ import { applyUpdate } from "./update/apply.js";
 import { reconcileUpdateMarker } from "./update/boot-guard.js";
 import { getChat4000SessionBinding } from "./session-binding.js";
 import { report } from "./telemetry.js";
+import { emitPluginBootAnalytics } from "./analytics.js";
+import { snapshotContainerRebuilt } from "./machine-ids.js";
 import type { ResolvedChat4000Account } from "./types.js";
+
+// PL1: plugin_started fires once per gateway process (not per account, and not on
+// one-shot CLI commands). The IDN9 rebuild signal was snapshotted at module load
+// (index.ts) before the env-id file was minted.
+let pluginStartedEmitted = false;
 
 type ReplyPipelineRuntime = {
   createChannelReplyPipeline: (params: {
@@ -176,6 +184,13 @@ export const chat4000Plugin = {
       }
 
       ctx.log?.info?.(`[${ctx.account.accountId}] Starting chat4000 (Matrix) channel`);
+
+      // PL1/PL5: fleet liveness on the first account brought up this process.
+      if (!pluginStartedEmitted) {
+        pluginStartedEmitted = true;
+        emitPluginBootAnalytics({ containerRebuilt: snapshotContainerRebuilt() });
+      }
+
       const runtimeLogger = new RuntimeLogger(ctx.account.runtimeLogLevel, {
         accountId: ctx.account.accountId,
         groupId: ctx.account.userId,
@@ -443,7 +458,7 @@ async function handleCommand(params: {
 }
 
 /**
- * PROTOCOL E session commands (session.new/rename/archive). Only the plugin
+ * PROTOCOL E session commands (session.new/rename/archive/delete). Only the plugin
  * creates sessions; the device asks via the control room. Runs against the live
  * client (which holds the space id), so it lives here rather than in commands.ts.
  */
@@ -485,6 +500,14 @@ async function handleSessionCommand(
           return { command: command.command, ok: false, error: "session.archive needs room_id" };
         }
         await archiveRoom(handle.client, spaceId, roomId);
+        return { command: command.command, ok: true, data: { room_id: roomId } };
+      }
+      case "session.delete": {
+        const roomId = typeof command.args.room_id === "string" ? command.args.room_id : "";
+        if (!roomId) {
+          return { command: command.command, ok: false, error: "session.delete needs room_id" };
+        }
+        await deleteSessionRoom(handle.client, spaceId, roomId);
         return { command: command.command, ok: true, data: { room_id: roomId } };
       }
       default:
@@ -711,23 +734,37 @@ async function dispatchToAgent(params: {
     log: (m) => runtimeLogger.debug("runtime.draft_stream", { msg_id: message.eventId, detail: m }),
   });
 
-  let lastTyping: boolean | undefined;
-  const setTyping = (on: boolean): void => {
-    if (lastTyping === on) return;
-    lastTyping = on;
-    // Fire-and-forget; typing is best-effort, but route any failure to the sink.
-    sendTyping(handle.client, roomId, on).catch((err: unknown) => report(err, "channel.setTyping"));
-  };
-
-  // PROTOCOL E: coarse agent-status label as a cleartext state event (deduped).
-  let lastStatus: AgentStatus | undefined;
-  const setStatus = (state: AgentStatus): void => {
-    if (lastStatus === state) return;
-    lastStatus = state;
+  // PROTOCOL E (protocol e3d9358): live activity is a `chat4000.status` event sent
+  // into the timeline (E2EE), referencing the QUESTION (the user's prompt event).
+  // Each status is a FRESH event — never an edit/overwrite. We send immediately on
+  // every state transition, re-send the current state every 4s as a keep-alive
+  // while the turn is active (shorter than the client's 10s TTL), and ALWAYS send
+  // `idle` at turn end (success / error / abort) so the label clears instantly.
+  const STATUS_KEEPALIVE_MS = 4_000;
+  const questionEventId = message.eventId;
+  let currentState: AgentStatusState = "idle";
+  let statusTimer: ReturnType<typeof setInterval> | undefined;
+  const pushStatus = (state: AgentStatusState): void => {
     // Fire-and-forget; status is best-effort, but route any failure to the sink.
-    sendAgentStatus(handle.client, roomId, state).catch((err: unknown) =>
+    sendAgentStatus(handle.client, roomId, state, questionEventId).catch((err: unknown) =>
       report(err, "channel.setStatus"),
     );
+  };
+  const setStatus = (state: AgentStatusState): void => {
+    if (state === currentState) return; // a transition is a CHANGE; the timer keeps it alive
+    currentState = state;
+    pushStatus(state); // immediate on every transition (incl. `idle` at end)
+    if (state === "idle") {
+      if (statusTimer) {
+        clearInterval(statusTimer);
+        statusTimer = undefined;
+      }
+      return;
+    }
+    if (!statusTimer) {
+      statusTimer = setInterval(() => pushStatus(currentState), STATUS_KEEPALIVE_MS);
+      statusTimer.unref(); // never hold the process open on a stray timer
+    }
   };
 
   // PROTOCOL E: surface each tool invocation as ONE chat4000.tool event related
@@ -798,13 +835,17 @@ async function dispatchToAgent(params: {
 
   runtimeLogger.info("runtime.ai_request_start", { msg_id: message.eventId });
 
+  // Reset the per-turn html-card flag so a prior turn's card never suppresses
+  // this turn's text answer (PROTOCOL E final_card; see card-finalize.ts).
+  clearCardFinalized(roomId);
+
   const replyPipeline = createChannelReplyPipeline({
     cfg: ctx.cfg,
     agentId: targetAgentId,
     channel: "chat4000",
     accountId: route.accountId ?? ctx.account.accountId,
     typing: {
-      start: () => setTyping(true),
+      start: () => setStatus("thinking"),
       onStartError: (err) => {
         runtimeLogger.info("runtime.ai_request_error", {
           msg_id: message.eventId,
@@ -831,62 +872,88 @@ async function dispatchToAgent(params: {
     },
   });
 
-  await runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg: ctx.cfg,
-    dispatcherOptions: {
-      ...replyPipeline,
-      deliver: async (payload: { text?: string }, info: { kind: string }) => {
-        if (info.kind !== "final") return;
-        const text = payload.text ?? "";
-        if (text.trim().length > 0) {
-          await draft.finalize(text);
-        }
-        draft.reset();
-        setStatus("idle");
-        setTyping(false);
+  try {
+    await runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: ctx.cfg,
+      dispatcherOptions: {
+        ...replyPipeline,
+        deliver: async (payload: { text?: string }, info: { kind: string }) => {
+          if (info.kind !== "final") return;
+          // PROTOCOL E: if a final_card tool call already delivered the answer
+          // for this turn, the streamed text would be a duplicate bubble — drop
+          // it (the card is the sole final-answer surface).
+          if (consumeCardFinalized(roomId)) {
+            draft.reset();
+            setStatus("idle");
+            return;
+          }
+          const text = payload.text ?? "";
+          if (text.trim().length > 0) {
+            await draft.finalize(text);
+          }
+          draft.reset();
+          setStatus("idle");
+        },
+        onError: (error: unknown, info: { kind: string }) => {
+          runtimeLogger.info("runtime.ai_request_error", {
+            msg_id: message.eventId,
+            error: String(error),
+            phase: info.kind,
+          });
+          setStatus("idle");
+        },
       },
-      onError: (error: unknown, info: { kind: string }) => {
-        runtimeLogger.info("runtime.ai_request_error", {
-          msg_id: message.eventId,
-          error: String(error),
-          phase: info.kind,
+      replyOptions: {
+        onReasoningStream: (): void => {
+          setStatus("thinking");
+        },
+        onAssistantMessageStart: (): void => {
+          setStatus("typing");
+        },
+        onPartialReply: (payload: { text?: string }): void => {
+          const text = payload.text ?? "";
+          if (!text) return;
+          setStatus("typing");
+          draft.update(text);
+        },
+        onToolStart: (): void => {
+          setStatus("working");
+        },
+        onItemEvent: onToolItem,
+      },
+    });
+  } finally {
+    // Close any tool bubble still `running`: the agent fires a tool START but can
+    // skip its END on cancel/abort/death, which would otherwise leave an eternal
+    // spinner. Mark anything still open as done at turn end (hermes c3e2c7f). A
+    // real END already flipped status away from "running", so this no-ops then.
+    for (const [tcid, rec] of tools) {
+      if (rec.status !== "running") continue;
+      rec.status = "done";
+      try {
+        await editToolEnd(handle.client, roomId, rec.eventId, {
+          tool_id: tcid,
+          name: rec.name,
+          args: rec.args,
+          status: "done",
+          result: rec.result,
+          duration_ms: Date.now() - rec.startTs,
         });
-        setStatus("idle");
-        setTyping(false);
-      },
-    },
-    replyOptions: {
-      onReasoningStream: (): void => {
-        setStatus("thinking");
-        setTyping(true);
-      },
-      onAssistantMessageStart: (): void => {
-        setStatus("typing");
-        setTyping(true);
-      },
-      onPartialReply: (payload: { text?: string }): void => {
-        const text = payload.text ?? "";
-        if (!text) return;
-        setStatus("typing");
-        setTyping(true);
-        draft.update(text);
-      },
-      onToolStart: (): void => {
-        setStatus("working");
-        setTyping(true);
-      },
-      onItemEvent: onToolItem,
-    },
-  });
-
-  await draft.dispose();
-  setStatus("idle");
-  setTyping(false);
+      } catch (err) {
+        report(err, "channel.flushOpenTools");
+      }
+    }
+    // ALWAYS clear the label and stop the keep-alive — success, error, or abort
+    // (protocol e3d9358). Without this, a throw would leave the 4s timer re-sending
+    // a stale `working`/`typing` forever (unref stops the process holding it, not
+    // the interval itself).
+    await draft.dispose();
+    setStatus("idle");
+  }
   runtimeLogger.info("runtime.ai_request_success", { msg_id: message.eventId });
 }
 
-type AgentStatus = "thinking" | "working" | "typing" | "idle";
 type ToolStatus = "running" | "done" | "failed";
 
 type ItemEventPayload = {

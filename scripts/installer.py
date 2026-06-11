@@ -87,14 +87,15 @@ NPM_PACKAGE = "@chat4000/openclaw-plugin"
 # Public PostHog credentials — same project the iOS / Mac apps and the
 # Hermes plugin use. Hardcoded so the installer can fire pre-install
 # events before the plugin (which embeds the same key) exists locally.
-POSTHOG_API_KEY = "phc_s49DnTamyFDnEC6MyumNmmjjf7p455LXCVzPE94hPemZ"
-POSTHOG_HOST = "https://us.i.posthog.com"
+POSTHOG_API_KEY = "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4"
+POSTHOG_HOST = "https://posthog.chat4000.com"
 POSTHOG_CAPTURE_URL = f"{POSTHOG_HOST}/capture/"
 
-# Sentry DSN matching the OpenClaw plugin's own runtime telemetry — so
-# installer crashes land in the same project as plugin-runtime crashes.
-# DSN is public-by-design (write-only ingestion endpoint, not a secret).
-SENTRY_DSN = "https://ca71dd0ea0a2740ec9ced9774c780197@o4511305222193152.ingest.us.sentry.io/4511305367289856"
+# Sentry DSN — the self-hosted chat4000 instance, the SAME project the Hermes
+# plugin reports to (sentry.chat4000.com project 2), consolidating crash
+# telemetry onto one self-hosted Sentry. DSN is public-by-design (write-only
+# ingestion endpoint, not a secret).
+SENTRY_DSN = "https://41cf740535c8a5a722cc1a13f090ea8d@sentry.chat4000.com/2"
 INSTALLER_RELEASE = "chat4000-openclaw-plugin-installer@1.0.0"
 
 import platform

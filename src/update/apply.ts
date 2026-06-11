@@ -21,6 +21,7 @@ import { execFile } from "node:child_process";
 import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { readPackageName } from "../package-info.js";
+import { flushAnalytics, track } from "../analytics.js";
 import { writeUpdateMarker } from "./boot-guard.js";
 import { checkUpdatePreflight, type RestartMethod, type UpdatePreflight } from "./preflight.js";
 
@@ -33,6 +34,12 @@ export type ApplyUpdateOptions = {
   force?: boolean | undefined;
   /** Restart the gateway after install so the new code loads. */
   restart?: boolean | undefined;
+  /**
+   * PL2: when set, emit `plugin_upgrading {from,to,trigger}` as the self-update
+   * starts. Left unset by non-upgrade callers (e.g. the boot-guard rollback) so
+   * a rollback is never mislabelled as an upgrade.
+   */
+  trigger?: "command" | "installer" | undefined;
   /** Seconds to wait before a detached/foreground restart, so callers can reply first. */
   restartDelaySeconds?: number | undefined;
   timeoutMs?: number | undefined;
@@ -157,6 +164,18 @@ export async function applyUpdate(opts: ApplyUpdateOptions = {}): Promise<ApplyU
         : "already up to date",
       preflight,
     };
+  }
+
+  // PL2: the self-update is starting — pairs with the registrar's RG2 row and
+  // the next plugin_started on the new version. Flush before the install/restart
+  // path, which would otherwise drop the in-flight event.
+  if (opts.trigger) {
+    track("plugin_upgrading", {
+      from_version: preflight.currentVersion,
+      to_version: target,
+      trigger: opts.trigger,
+    });
+    await flushAnalytics();
   }
 
   const installed = await installVersion(packageName, target, timeoutMs, log);

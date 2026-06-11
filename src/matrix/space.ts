@@ -163,6 +163,23 @@ export async function renameRoom(
 }
 
 /**
+ * Delete a session room (`session.delete`): unlink it from the space, then leave
+ * and forget it so it disappears from the plugin entirely. Unlike
+ * {@link archiveRoom} (which only drops the space link), this also removes the
+ * bot from the room.
+ */
+export async function deleteSessionRoom(
+  client: MatrixClient,
+  spaceId: string,
+  roomId: string,
+): Promise<void> {
+  // Unlink first so the app stops listing it even if leave/forget fail.
+  await sendState(client, spaceId, SPACE_CHILD, {}, roomId);
+  await client.leave(roomId);
+  await client.forget(roomId);
+}
+
+/**
  * Archive a session room (`session.archive`): drop it from the space so the app
  * stops listing it under the plugin. The room itself is left intact (history is
  * not destroyed).

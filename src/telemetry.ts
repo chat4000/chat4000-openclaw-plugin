@@ -10,7 +10,11 @@ import { SENTRY_DSN } from "./telemetry-dsn.generated.js";
 // DSN is generated locally into telemetry-dsn.generated.ts before packaging.
 const PACKAGE_VERSION = readPackageVersion();
 const CONFIG_DIR = path.join(os.homedir(), ".config", "chat4000");
-const INSTALL_ID_PATH = path.join(CONFIG_DIR, "install-id");
+/**
+ * The env_id file (analytics plan v5 IDN7 — the CHURNY machine id). Exported so
+ * the IDN9 classifier can test its presence and analytics can read its value.
+ */
+export const INSTALL_ID_PATH = path.join(CONFIG_DIR, "install-id");
 const TELEMETRY_ENABLED_PATH = path.join(CONFIG_DIR, "telemetry-enabled");
 
 let sentryClient: typeof import("@sentry/node") | undefined;
@@ -264,6 +268,14 @@ export function scrubSecrets(text: string): string {
 
 function scrubPath(value: string): string {
   return value.replaceAll(os.homedir(), "~").replace(/\/(Users|home)\/[^/]+/g, "/$1/<user>");
+}
+
+/**
+ * The env_id value (IDN7) — the churny `~/.config/chat4000/install-id`, minted
+ * on first read. Rides as a property on analytics events.
+ */
+export function getEnvId(): string {
+  return resolveInstallId();
 }
 
 function resolveInstallId(): string {

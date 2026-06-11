@@ -1,7 +1,13 @@
 import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
 import { registerChat4000Cli } from "./src/cli.js";
 import { initializeChat4000Telemetry } from "./src/telemetry.js";
+import { snapshotContainerRebuilt } from "./src/machine-ids.js";
+import { registerFinalCardTool } from "./src/final-card-tool.js";
 
+// IDN9 MUST be sampled before telemetry init mints the env-id file (its absence
+// is the docker-rebuild signal). The gateway boot reads the snapshot and emits
+// plugin_started / container_rebuilt (PL1/PL5) — see channel.ts.
+snapshotContainerRebuilt();
 initializeChat4000Telemetry();
 
 // Public surface (v2 — Matrix).
@@ -30,4 +36,6 @@ export default defineBundledChannelEntry({
     exportName: "chat4000Plugin",
   },
   registerCliMetadata: registerChat4000Cli,
+  // PROTOCOL E: register the `final_card` HTML-card tool on the full plugin API.
+  registerFull: (api) => registerFinalCardTool(api),
 });

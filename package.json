@@ -69,7 +69,8 @@
     "matrix-encrypt-attachment": "^1.0.3",
     "matrix-js-sdk": "^41.6.0",
     "neverthrow": "^8.2.0",
-    "qrcode-terminal": "^0.12.0"
+    "qrcode-terminal": "^0.12.0",
+    "typebox": "1.1.38"
   },
   "engines": {
     "node": ">=18.17.0"

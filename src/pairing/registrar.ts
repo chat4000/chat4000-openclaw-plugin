@@ -33,6 +33,11 @@ type PairStatus = "pending" | "completed" | "expired";
 export type PairStatusResult = {
   status: PairStatus;
   userId?: string | undefined;
+  /**
+   * FLW2: the redeeming phone's analytics `client_id`, present on `completed`
+   * when the phone sent one (absent on old registrars / telemetry-off phones).
+   */
+  clientId?: string | undefined;
 };
 
 type VersionAction = "ok" | "recommend_upgrade" | "force_upgrade";
@@ -146,9 +151,16 @@ export class RegistrarClient {
     clientVersion: string;
     releaseChannel: string;
     platform?: string;
+    /**
+     * PL3: the machine analytics id (agent_install_id) — rides ONLY as the
+     * `X-Client-Id` header. Pass null/undefined when telemetry is off so the id
+     * never rides. There is no `posthog_id` body field (never had one here).
+     */
+    clientId?: string | null | undefined;
   }): Promise<VersionPolicyResult> {
     const body = (await this.request("POST", "/version", {
       auth: false,
+      clientId: params.clientId,
       body: {
         app_id: params.appId,
         client_version: params.clientVersion,
@@ -177,19 +189,22 @@ export class RegistrarClient {
     return {
       status: String(body.status) as PairStatus,
       userId: typeof body.user_id === "string" ? body.user_id : undefined,
+      clientId: typeof body.client_id === "string" ? body.client_id : undefined,
     };
   }
 
   private async request(
     method: string,
     pathName: string,
-    opts: { auth: boolean; body?: unknown },
+    opts: { auth: boolean; body?: unknown; clientId?: string | null | undefined },
   ): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     const headers: Record<string, string> = { Accept: "application/json" };
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
     if (opts.auth) headers.Authorization = `Bearer ${this.serviceToken}`;
+    // PL3: the machine analytics id. Caller passes null when telemetry is off.
+    if (opts.clientId) headers["X-Client-Id"] = opts.clientId.slice(0, 64);
 
     try {
       const res = await this.fetchImpl(`${this.baseUrl}${pathName}`, {

@@ -102,7 +102,58 @@ describe("RegistrarClient", () => {
     });
 
     const res = await client.getPairingStatus("ABC-123");
-    expect(res).toEqual({ status: "completed", userId: "@u_x:chat4000.com" });
+    expect(res).toEqual({ status: "completed", userId: "@u_x:chat4000.com", clientId: undefined });
+  });
+
+  it("getPairingStatus surfaces the redeeming phone's client_id when completed (FLW2)", async () => {
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch(() => ({
+        status: 200,
+        body: { status: "completed", user_id: "@u_x:chat4000.com", client_id: "phone-uuid" },
+      })),
+    });
+
+    const res = await client.getPairingStatus("ABC-123");
+    expect(res).toEqual({
+      status: "completed",
+      userId: "@u_x:chat4000.com",
+      clientId: "phone-uuid",
+    });
+  });
+
+  it("checkVersion sends X-Client-Id when a clientId is given, omits it otherwise (PL3)", async () => {
+    let captured: RequestInit | undefined;
+    const fetchImpl = mockFetch((_url, init) => {
+      captured = init;
+      return { status: 200, body: { action: "ok" } };
+    });
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl,
+    });
+
+    await client.checkVersion({
+      appId: "@chat4000/openclaw-plugin",
+      clientVersion: "1.9.0",
+      releaseChannel: "stage",
+      clientId: "agent-install-id-123",
+    });
+    expect((captured?.headers as Record<string, string>)["X-Client-Id"]).toBe(
+      "agent-install-id-123",
+    );
+
+    // Telemetry off → caller passes null → header omitted, and no posthog_id body.
+    await client.checkVersion({
+      appId: "@chat4000/openclaw-plugin",
+      clientVersion: "1.9.0",
+      releaseChannel: "stage",
+      clientId: null,
+    });
+    expect((captured?.headers as Record<string, string>)["X-Client-Id"]).toBeUndefined();
+    expect(JSON.parse(bodyText(captured?.body))).not.toHaveProperty("posthog_id");
   });
 
   it("surfaces {errcode,error} as RegistrarError with status flags", async () => {

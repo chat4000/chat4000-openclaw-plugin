@@ -29,7 +29,7 @@ function mockClient(): { client: MatrixClient; sent: SentEvent[]; state: SentSta
   return { client, sent, state };
 }
 
-describe("turn / tool / status sends (PROTOCOL E)", () => {
+describe("turn / tool sends (PROTOCOL E)", () => {
   it("sendToolStart links the tool to the turn via an ENCRYPTED field, not m.relates_to", async () => {
     const m = mockClient();
     const id = await sendToolStart(m.client, "!r:hs", "$anchor", {
@@ -71,20 +71,23 @@ describe("turn / tool / status sends (PROTOCOL E)", () => {
     ).toBe("done");
   });
 
-  it("sendAgentStatus writes a cleartext chat4000.status state event", async () => {
-    const m = mockClient();
-    await sendAgentStatus(m.client, "!r:hs", "thinking");
-    expect(m.state[0]).toMatchObject({
-      type: "chat4000.status",
-      stateKey: "",
-      content: { state: "thinking" },
-    });
-  });
-
   it("sendTurnAnchor posts a normal text message (the answer anchor)", async () => {
     const m = mockClient();
     const id = await sendTurnAnchor(m.client, "!r:hs");
     expect(id).toBe("$ev1");
     expect(m.sent[0].content.msgtype).toBe("m.text");
+  });
+
+  it("sendAgentStatus sends a chat4000.status timeline event referencing the QUESTION", async () => {
+    const m = mockClient();
+    await sendAgentStatus(m.client, "!r:hs", "working", "$question");
+    // A timeline event (encrypted by the SDK), NOT a state event.
+    expect(m.state).toHaveLength(0);
+    expect(m.sent[0].type).toBe("chat4000.status");
+    const c = m.sent[0].content;
+    expect(c.state).toBe("working");
+    // References the question via cleartext m.relates_to / m.reference (the SDK
+    // hoists it); the `state` word stays inside the ciphertext.
+    expect(c["m.relates_to"]).toEqual({ rel_type: "m.reference", event_id: "$question" });
   });
 });
