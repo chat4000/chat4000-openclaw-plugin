@@ -7,21 +7,26 @@
  * in. The plugin polls `/pair/status` until `completed`, then (§3.3) invites the
  * returned `user_id` to a room so messages can flow.
  *
- * The QR encodes what the app needs to redeem: the registrar URL + code.
+ * The QR encodes a UNIVERSAL https link (not a custom scheme) so any phone
+ * camera app can scan it: it opens pair.chat4000.com, which deep-links into the
+ * app (or shows install instructions when the app isn't there yet). The page —
+ * not the link — owns backend routing, so the code is the only payload.
  */
 import { RegistrarClient, generatePairingCode } from "./registrar.js";
+
+/** Base of the universal pairing link any camera app can open. */
+const PAIR_LINK_BASE = "https://pair.chat4000.com";
 
 export type StartHumanPairingResult = {
   code: string;
   expiresAt: number;
-  /** URI the app reads to know where + what to redeem. */
+  /** Universal https link the app/camera opens to redeem the code. */
   qrUri: string;
 };
 
 /** Register a fresh pairing code keyed to this plugin. */
 export async function startHumanPairing(params: {
   registrar: RegistrarClient;
-  registrarUrl: string;
   pluginId: string;
   ttlSeconds?: number;
   userId?: string;
@@ -36,17 +41,14 @@ export async function startHumanPairing(params: {
   return {
     code,
     expiresAt: result.expiresAt,
-    qrUri: buildQrUri({ registrarUrl: params.registrarUrl, code }),
+    qrUri: buildQrUri({ code }),
   };
 }
 
-export function buildQrUri(payload: { registrarUrl: string; code: string }): string {
-  const params = new URLSearchParams({
-    v: "2",
-    registrar: payload.registrarUrl,
-    code: payload.code,
-  });
-  return `chat4000://pair?${params.toString()}`;
+/** The universal pairing link encoded in the QR: `https://pair.chat4000.com/?code=<code>`. */
+export function buildQrUri(payload: { code: string }): string {
+  const params = new URLSearchParams({ code: payload.code });
+  return `${PAIR_LINK_BASE}/?${params.toString()}`;
 }
 
 /** Render an ASCII QR for the URI, if qrcode-terminal is available. */

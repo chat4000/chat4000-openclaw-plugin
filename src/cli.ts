@@ -465,14 +465,13 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   if (!account.configured) {
     throw new Error('No Matrix identity yet. Run "openclaw chat4000 setup" first.');
   }
-  const { client, url } = resolveRegistrar(account, opts);
+  const { client } = resolveRegistrar(account, opts);
   await enforceVersionBeforePrivileged(client, account.config.releaseChannel);
   const pluginId = account.pluginId ?? getOrCreatePluginId(account.accountId);
   const ttlSeconds = Math.max(1, Math.min(3600, Number.parseInt(opts.ttl ?? "300", 10) || 300));
 
   const pairing = await startHumanPairing({
     registrar: client,
-    registrarUrl: url,
     pluginId,
     ttlSeconds,
   });
