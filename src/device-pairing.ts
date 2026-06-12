@@ -8,10 +8,16 @@
  * plugin's `_device_pair_start` / `_device_pair_cancel` / `_poll_pairing`.
  */
 import { randomBytes } from "node:crypto";
-import { generatePairingCode, type RegistrarClient } from "./pairing/registrar.js";
+import {
+  generatePairingCode,
+  isTransientRegistrarError,
+  type RegistrarClient,
+} from "./pairing/registrar.js";
 
 const DEVICE_PAIR_TTL_SECONDS = 120;
 const PAIR_STATUS_POLL_INTERVAL_MS = 1_500;
+/** Exponential-backoff cap for transient /pair/status failures. */
+const PAIR_STATUS_MAX_BACKOFF_MS = 30_000;
 
 export type PairStatusState = "completed" | "expired" | "error" | "cancelled";
 
@@ -111,14 +117,22 @@ export class DevicePairingManager {
 
   private async poll(pairId: string, code: string, signal: AbortSignal): Promise<void> {
     const deadline = Date.now() + this.ttlSeconds * 1000;
+    let delayMs = this.pollIntervalMs;
     try {
       while (Date.now() < deadline && !signal.aborted) {
         let status: Awaited<ReturnType<RegistrarClient["getPairingStatus"]>> | undefined;
         try {
           status = await this.deps.registrar.getPairingStatus(code);
+          delayMs = this.pollIntervalMs; // a successful poll resets the backoff
         } catch (err) {
-          // Transient poll failure — report and keep polling until the deadline.
+          // Permanent registrar error (e.g. bad service token) — fail fast via
+          // the outer catch, which streams an `error` pair_status.
+          if (!isTransientRegistrarError(err)) throw err;
+          // Transient (429 / 502-504 / network) — report and keep polling with
+          // exponential backoff inside the same deadline (observed live
+          // 2026-06-12: a 429 from /pair/status killed the Hermes twin's pairing).
           this.deps.report(err, "device_pairing.status");
+          delayMs = Math.min(delayMs * 2, PAIR_STATUS_MAX_BACKOFF_MS);
         }
         if (signal.aborted) return;
         if (status?.status === "completed") {
@@ -130,7 +144,7 @@ export class DevicePairingManager {
           await this.deps.sendPairStatus(pairId, "expired");
           return;
         }
-        await sleep(this.pollIntervalMs, signal);
+        await sleep(Math.min(delayMs, Math.max(0, deadline - Date.now())), signal);
       }
       if (!signal.aborted) await this.deps.sendPairStatus(pairId, "expired");
     } catch (err) {

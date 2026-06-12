@@ -3,6 +3,7 @@ import {
   RegistrarClient,
   RegistrarError,
   generatePairingCode,
+  isTransientRegistrarError,
 } from "../../src/pairing/registrar.js";
 
 /** The request body in these tests is always a JSON string we set ourselves. */
@@ -171,6 +172,27 @@ describe("RegistrarClient", () => {
     expect((err as RegistrarError).status).toBe(409);
     expect((err as RegistrarError).isConflict).toBe(true);
     expect((err as RegistrarError).errcode).toBe("M_IN_USE");
+  });
+
+  it("classifies 429/502/503/504 as transient and other 4xx as permanent", () => {
+    // Live failure 2026-06-12: /pair/status answered 429 M_LIMIT_EXCEEDED and
+    // pairing died — these must be retried by the status-polling paths.
+    for (const status of [429, 502, 503, 504]) {
+      const error = new RegistrarError("try later", status, "M_LIMIT_EXCEEDED");
+      expect(error.isTransient).toBe(true);
+      expect(isTransientRegistrarError(error)).toBe(true);
+    }
+    for (const status of [400, 401, 403, 404, 409, 410]) {
+      const error = new RegistrarError("permanent", status);
+      expect(error.isTransient).toBe(false);
+      expect(isTransientRegistrarError(error)).toBe(false);
+    }
+  });
+
+  it("classifies connection-level failures (non-RegistrarError) as transient", () => {
+    // What `fetch` throws on DNS failure / refused connection / timeout abort.
+    expect(isTransientRegistrarError(new TypeError("fetch failed"))).toBe(true);
+    expect(isTransientRegistrarError(new DOMException("aborted", "AbortError"))).toBe(true);
   });
 
   it("generatePairingCode returns exactly 6 digits (PROTOCOL C.1/C.2)", () => {

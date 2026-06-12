@@ -1,4 +1,4 @@
-import { stdout as output } from "node:process";
+import process, { stdout as output } from "node:process";
 import { rmSync } from "node:fs";
 import { resolveChat4000Account } from "./accounts.js";
 import { dumpChat4000Trace } from "./error-log.js";
@@ -9,7 +9,11 @@ import { createPairedRoom, ensureInitialSessionForUser, inviteUserToRooms } from
 import { readPluginRooms } from "./matrix/space.js";
 import { endpointsForEnv, resolveEnv, type Chat4000Env } from "./pairing/env.js";
 import { getOrCreatePluginId } from "./pairing/instance.js";
-import { RegistrarClient } from "./pairing/registrar.js";
+import {
+  isTransientRegistrarError,
+  RegistrarClient,
+  type PairStatusResult,
+} from "./pairing/registrar.js";
 import { checkPluginVersion, formatVersionNotice } from "./pairing/version-check.js";
 import { renderQr, startHumanPairing } from "./pairing/qr.js";
 import { resolveChat4000AccountStateDir } from "./paths.js";
@@ -487,6 +491,11 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   await runPair(api, { account: account.accountId, env: opts.env, stage: opts.stage });
 }
 
+/** Normal /pair/status poll cadence. */
+const PAIR_STATUS_POLL_INTERVAL_MS = 2_000;
+/** Exponential-backoff cap for transient /pair/status failures. */
+const PAIR_STATUS_MAX_BACKOFF_MS = 30_000;
+
 async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<void> {
   const cfg = loadConfig(api);
   const account = resolveChat4000Account({
@@ -510,74 +519,86 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   await renderQr(pairing.qrUri, (line) => output.write(`${line}\n`));
   output.write(`Redeem in the chat4000 app within ${ttlSeconds}s.\n`);
 
-  // Poll /pair/status until completed or expired.
+  // Poll /pair/status until completed or expired. Transient registrar failures
+  // (429 rate limits, 502/503/504, network errors) must NOT kill pairing —
+  // observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED from /pair/status killed
+  // the Hermes twin of this flow mid-pairing. They retry with exponential
+  // backoff (2s doubling to a 30s cap) inside the same overall deadline; other
+  // 4xx (bad token, unknown code, …) are permanent and fail fast.
   const deadline = Date.now() + ttlSeconds * 1000;
+  let pollDelayMs = PAIR_STATUS_POLL_INTERVAL_MS;
   while (Date.now() < deadline) {
-    await sleep(2000);
+    await sleep(Math.min(pollDelayMs, deadline - Date.now()));
+    let status: PairStatusResult;
     try {
-      const status = await client.getPairingStatus(pairing.code);
-      if (status.status === "completed") {
-        // PL4 / FLW2-4: the registrar hands us the redeeming phone's client_id —
-        // emit the machine↔phone join event and register the super property
-        // (latest pairing wins). Absent on old registrars / telemetry-off phones.
-        const pairedClientId = status.clientId?.trim();
-        if (pairedClientId) registerPairedClientId(pairedClientId);
-        // PL4: the canonical prop is paired_client_id only (absent on old
-        // registrars / telemetry-off phones; the event still counts the join).
-        track("pairing_completed", pairedClientId ? { paired_client_id: pairedClientId } : {});
-        await flushAnalytics();
-        output.write(`✓ Device paired${status.userId ? ` (${status.userId})` : ""}.\n`);
-        // PROTOCOL C.3 + E: on completion the plugin invites the user into its
-        // control room + space (created by the gateway). If the gateway hasn't
-        // created them yet, fall back to a DM so messages can still flow.
-        if (status.userId) {
-          const credentials = {
-            gatewayUrl: account.gatewayUrl,
-            userId: account.userId,
-            accessToken: account.accessToken,
-            deviceId: account.deviceId,
-            pluginId: account.pluginId,
-          };
-          const rooms = readPluginRooms(account.accountId);
-          try {
-            if (rooms.spaceId && rooms.controlRoomId) {
-              await inviteUserToRooms({
-                credentials,
-                roomIds: [rooms.controlRoomId, rooms.spaceId],
-                userId: status.userId,
-              });
-              output.write(`✓ Invited ${status.userId} to the control room + space.\n`);
-              // PROTOCOL E: auto-create their first session room so a fresh device
-              // has a conversation without pressing "New Session" (deduped).
-              const sessionRoom = await ensureInitialSessionForUser({
-                credentials,
-                accountId: account.accountId,
-                spaceId: rooms.spaceId,
-                userId: status.userId,
-              });
-              if (sessionRoom) output.write(`✓ Created your first session room.\n`);
-            } else {
-              const room = await createPairedRoom({
-                credentials,
-                inviteUserId: status.userId,
-                name: "chat4000",
-              });
-              output.write(`✓ Created room ${room.roomId} and invited ${status.userId}.\n`);
-              output.write("  Start the gateway to create the plugin's control room + space.\n");
-            }
-          } catch (err) {
-            output.write(`⚠ Paired, but inviting the user failed: ${String(err)}\n`);
-            output.write("  The gateway will reconcile once it's running.\n");
+      status = await client.getPairingStatus(pairing.code);
+    } catch (error) {
+      if (isTransientRegistrarError(error)) {
+        pollDelayMs = Math.min(pollDelayMs * 2, PAIR_STATUS_MAX_BACKOFF_MS);
+        continue;
+      }
+      throw error; // permanent registrar error — surfaced via handleCliError
+    }
+    pollDelayMs = PAIR_STATUS_POLL_INTERVAL_MS; // a successful poll resets the backoff
+    if (status.status === "completed") {
+      // PL4 / FLW2-4: the registrar hands us the redeeming phone's client_id —
+      // emit the machine↔phone join event and register the super property
+      // (latest pairing wins). Absent on old registrars / telemetry-off phones.
+      const pairedClientId = status.clientId?.trim();
+      if (pairedClientId) registerPairedClientId(pairedClientId);
+      // PL4: the canonical prop is paired_client_id only (absent on old
+      // registrars / telemetry-off phones; the event still counts the join).
+      track("pairing_completed", pairedClientId ? { paired_client_id: pairedClientId } : {});
+      await flushAnalytics();
+      output.write(`✓ Device paired${status.userId ? ` (${status.userId})` : ""}.\n`);
+      // PROTOCOL C.3 + E: on completion the plugin invites the user into its
+      // control room + space (created by the gateway). If the gateway hasn't
+      // created them yet, fall back to a DM so messages can still flow.
+      if (status.userId) {
+        const credentials = {
+          gatewayUrl: account.gatewayUrl,
+          userId: account.userId,
+          accessToken: account.accessToken,
+          deviceId: account.deviceId,
+          pluginId: account.pluginId,
+        };
+        const rooms = readPluginRooms(account.accountId);
+        try {
+          if (rooms.spaceId && rooms.controlRoomId) {
+            await inviteUserToRooms({
+              credentials,
+              roomIds: [rooms.controlRoomId, rooms.spaceId],
+              userId: status.userId,
+            });
+            output.write(`✓ Invited ${status.userId} to the control room + space.\n`);
+            // PROTOCOL E: auto-create their first session room so a fresh device
+            // has a conversation without pressing "New Session" (deduped).
+            const sessionRoom = await ensureInitialSessionForUser({
+              credentials,
+              accountId: account.accountId,
+              spaceId: rooms.spaceId,
+              userId: status.userId,
+            });
+            if (sessionRoom) output.write(`✓ Created your first session room.\n`);
+          } else {
+            const room = await createPairedRoom({
+              credentials,
+              inviteUserId: status.userId,
+              name: "chat4000",
+            });
+            output.write(`✓ Created room ${room.roomId} and invited ${status.userId}.\n`);
+            output.write("  Start the gateway to create the plugin's control room + space.\n");
           }
+        } catch (err) {
+          output.write(`⚠ Paired, but inviting the user failed: ${String(err)}\n`);
+          output.write("  The gateway will reconcile once it's running.\n");
         }
-        return;
       }
-      if (status.status === "expired") {
-        output.write('Pairing code expired. Re-run "openclaw chat4000 pair".\n');
-        return;
-      }
-    } catch {
-      // transient; keep polling
+      return;
+    }
+    if (status.status === "expired") {
+      output.write('Pairing code expired. Re-run "openclaw chat4000 pair".\n');
+      return;
     }
   }
   output.write(
@@ -914,4 +935,10 @@ function handleCliError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   const logPath = dumpChat4000Trace("cli", error);
   output.write(`chat4000 error: ${message}\nTrace log: ${logPath}\n`);
+  // Observed live 2026-06-12: `setup --self-redeem` printed "chat4000 error:
+  // Invalid service token" / "Missing registrar SERVICE_TOKEN" / "No Matrix
+  // identity yet" yet still exited 0, so the installer treated the failed setup
+  // as success. Mark the process failed; setting exitCode (instead of calling
+  // process.exit()) lets pending writes and the host's teardown finish.
+  process.exitCode = 1;
 }

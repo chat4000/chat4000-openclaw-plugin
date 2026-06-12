@@ -74,6 +74,28 @@ export class RegistrarError extends Error {
   get isGone(): boolean {
     return this.status === 410;
   }
+
+  /**
+   * Transient registrar failures worth retrying while polling: 429 rate limits
+   * and 502/503/504 upstream hiccups. Every other HTTP error (401/403/404/409/
+   * 410, …) is permanent and should keep failing fast.
+   */
+  get isTransient(): boolean {
+    return this.status === 429 || this.status === 502 || this.status === 503 || this.status === 504;
+  }
+}
+
+/**
+ * True for errors the /pair/status polling path retries with backoff instead of
+ * killing pairing (observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED from
+ * /pair/status killed the Hermes twin's pairing). Transient = HTTP 429 and
+ * 502/503/504, plus anything that is NOT a structured {@link RegistrarError} —
+ * those come from `fetch` itself (DNS failure, refused/reset connection, the
+ * request-timeout abort), i.e. connection-level failures. Other 4xx keep
+ * failing fast.
+ */
+export function isTransientRegistrarError(error: unknown): boolean {
+  return error instanceof RegistrarError ? error.isTransient : true;
 }
 
 export type RegistrarClientOptions = {
