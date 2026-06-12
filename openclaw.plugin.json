@@ -1,6 +1,7 @@
 {
   "id": "chat4000",
   "channels": ["chat4000"],
+  "contracts": { "tools": ["final_card"] },
   "channelConfigs": {
     "chat4000": {
       "label": "chat4000",

@@ -335,8 +335,23 @@ export class MatrixClientHandle {
       if (decoded) this.opts.onMessage?.(decoded);
     };
 
-    if (event.isEncrypted() && event.isBeingDecrypted?.()) {
-      event.once(MatrixEventEvent.Decrypted, () => deliver());
+    // Encrypted events arrive as ciphertext (`m.room.encrypted`) and decrypt
+    // ASYNCHRONOUSLY — often only AFTER the room key shows up in a later
+    // to-device message, at which point matrix-js-sdk re-decrypts and re-emits
+    // `Decrypted`. getType() stays `m.room.encrypted` until a decrypt succeeds.
+    // Wait for a SUCCESSFUL decryption in every not-yet-clear case (being
+    // decrypted, failed/UTD, or not started) — the previous check only waited
+    // while a decrypt was mid-flight, so a message whose key arrived a beat
+    // later was delivered as ciphertext, dropped by decode, and lost forever.
+    if (event.isEncrypted() && !event.getClearContent()) {
+      const onDecrypted = (): void => {
+        // A failed attempt (key not here yet) keeps the listener armed for the
+        // retry matrix-js-sdk runs when the room key finally arrives.
+        if (event.isDecryptionFailure()) return;
+        event.off(MatrixEventEvent.Decrypted, onDecrypted);
+        deliver();
+      };
+      event.on(MatrixEventEvent.Decrypted, onDecrypted);
       return;
     }
     deliver();
