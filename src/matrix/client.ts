@@ -88,6 +88,8 @@ export type MatrixClientHandleOptions = {
 /** Sliding-sync shape for a plugin bot: all state + a modest timeline tail. */
 const ALL_STATE: string[][] = [["*", "*"]];
 const SLIDING_TIMELINE_LIMIT = 30;
+/** How long to wait for a room key before surfacing a message as undecryptable. */
+const UTD_SURFACE_MS = 30_000;
 
 export class MatrixClientHandle {
   readonly client: MatrixClient;
@@ -344,17 +346,43 @@ export class MatrixClientHandle {
     // while a decrypt was mid-flight, so a message whose key arrived a beat
     // later was delivered as ciphertext, dropped by decode, and lost forever.
     if (event.isEncrypted() && !event.getClearContent()) {
+      // Surface a message that stays undecryptable past the window so an
+      // "Unable to Decrypt" is never invisible (mirrors hermes' UTD log). The
+      // Decrypted listener below stays armed, so a key that lands even later
+      // still recovers the message — we report better than hermes (it skips),
+      // and now shout as loudly as hermes does.
+      const utdTimer = setTimeout(() => {
+        if (!event.getClearContent()) this.reportUndecryptable(event);
+      }, UTD_SURFACE_MS);
+      utdTimer.unref?.();
       const onDecrypted = (): void => {
         // A failed attempt (key not here yet) keeps the listener armed for the
         // retry matrix-js-sdk runs when the room key finally arrives.
         if (event.isDecryptionFailure()) return;
         event.off(MatrixEventEvent.Decrypted, onDecrypted);
+        clearTimeout(utdTimer);
         deliver();
       };
       event.on(MatrixEventEvent.Decrypted, onDecrypted);
       return;
     }
     deliver();
+  }
+
+  /**
+   * Surface an "Unable to Decrypt": the room key never arrived within the
+   * window, so the message can't be processed. Logged locally with the Megolm
+   * session id + sender (to correlate against the sender's key-share), and
+   * reported once to the sink (rate-limited there by error fingerprint).
+   */
+  private reportUndecryptable(event: MatrixEvent): void {
+    const content = event.getWireContent() as Record<string, unknown>;
+    const sessionId = typeof content.session_id === "string" ? content.session_id : "unknown";
+    const detail = `room=${event.getRoomId() ?? "?"} megolm_session_id=${sessionId} sender=${event.getSender() ?? "?"}`;
+    this.opts.log?.warn?.(
+      `chat4000: UTD — message still undecryptable after ${UTD_SURFACE_MS}ms (${detail})`,
+    );
+    report(new Error("matrix UTD: message undecryptable (room key missing)"), `matrix.utd ${detail}`);
   }
 
   /**
