@@ -1040,6 +1040,21 @@ async function dispatchToAgent(params: {
         },
       },
       replyOptions: {
+        // chat4000 is an AUTOMATIC-delivery channel: the agent's final reply is
+        // rendered straight into the E2EE room by our own draft stream (sendText/
+        // editText) — there is no generic "message tool" wired to a chat4000 room,
+        // so the only delivery surface is this plugin. We must therefore declare
+        // automatic source-reply delivery explicitly; otherwise OpenClaw inherits
+        // the *model harness* default (the Codex/OpenAI app-server harness ships
+        // `deliveryDefaults.sourceVisibleReplies: "message_tool"`, meant for
+        // autonomous coding agents). Under that default,
+        // resolveSourceReplyDeliveryMode() returns "message_tool_only", OpenClaw
+        // keeps the agent's final text PRIVATE, never calls our `deliver` callback,
+        // and the user sees an accepted message with no reply. `requested` wins
+        // over the harness default in the host policy, so this is the correct,
+        // host-sanctioned way for a self-rendering channel to state its contract —
+        // robust on any box regardless of model/profile.
+        sourceReplyDeliveryMode: "automatic",
         onReasoningStream: (): void => {
           setStatus("thinking");
         },
