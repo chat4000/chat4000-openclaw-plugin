@@ -1,11 +1,16 @@
 /**
- * HTTP client for the chat4000 Registrar (PROTOCOL §3).
+ * HTTP client for the chat4000 Registrar (PROTOCOL C).
  *
- *   POST /pair/register  (bearer SERVICE_TOKEN)  { code, plugin_id, user_id?, ttl_seconds? }
- *                                                -> { ok, expires_at }
+ *   POST /user/ensure    (bearer SERVICE_TOKEN)  { plugin_id }
+ *                                                -> { user_id, created }          (C.6.1)
+ *   POST /pair/register  (bearer SERVICE_TOKEN)  { code, plugin_id, user_id?,
+ *                                                  ttl_seconds?, reusable? }
+ *                                                -> { ok, expires_at }            (C.1)
  *   POST /pair/redeem    (public; code is secret) { code, device_name? }
  *                                                -> { gateway_url, user_id, device_id, access_token }
- *   GET  /pair/status?code=...  (bearer)         -> { status: pending|completed|expired, user_id? }
+ *   GET  /pair/status?code=...  (bearer)         -> { status, user_id?, client_id?,
+ *                                                     redeems[], redeemed_count,
+ *                                                     expires_at? }               (C.3)
  *
  * The plugin picks the pairing `code`. Errors are JSON `{errcode, error}` with the
  * documented HTTP status.
@@ -30,14 +35,45 @@ export type PairRedeemResult = {
 
 type PairStatus = "pending" | "completed" | "expired";
 
+/** One completed redeem of a code (PROTOCOL C.3 `redeems[]` entries). */
+export type PairRedeem = {
+  deviceId: string;
+  /** Per-redeem analytics id; absent when that device's telemetry was off. */
+  clientId?: string | undefined;
+  /** Unix ms of the redeem. */
+  redeemedAt: number;
+};
+
 export type PairStatusResult = {
+  /**
+   * PROTOCOL C.3: a single-use code settles `completed`; a reusable code stays
+   * `pending` while live, however many redeems it has. A watcher waiting for
+   * "someone paired" checks `redeems` non-empty, not `status`.
+   */
   status: PairStatus;
   userId?: string | undefined;
   /**
-   * FLW2: the redeeming phone's analytics `client_id`, present on `completed`
-   * when the phone sent one (absent on old registrars / telemetry-off phones).
+   * FLW2: the MOST RECENT redeem's analytics `client_id`, present when that
+   * phone sent one (absent on old registrars / telemetry-off phones).
    */
   clientId?: string | undefined;
+  /**
+   * One entry per completed redeem, oldest first (most recent 20 for a
+   * long-lived reusable code). Empty while nothing has redeemed.
+   */
+  redeems: PairRedeem[];
+  /** Total redeems of this code (may exceed `redeems.length` once truncated). */
+  redeemedCount: number;
+  /** Unix ms the code expires; present while `pending` (C.3). */
+  expiresAt?: number | undefined;
+};
+
+/** PROTOCOL C.6.1 `POST /user/ensure` result. */
+export type EnsureUserResult = {
+  /** The plugin's one user MXID (registrar-generated). */
+  userId: string;
+  /** True when this call created the account; false on an idempotent repeat. */
+  created: boolean;
 };
 
 type VersionAction = "ok" | "recommend_upgrade" | "force_upgrade";
@@ -124,9 +160,25 @@ export class RegistrarClient {
   }
 
   /**
-   * Reserve a pairing code (PROTOCOL §3.1). `kind="user"` (default) requires a
-   * `pluginId` (which plugin the user pairs with); `kind="plugin"` omits it (the
-   * registrar issues a new plugin_id at redeem).
+   * Create (or return) the plugin's one user (PROTOCOL C.6.1). Idempotent per
+   * `pluginId` — a repeat returns the SAME user with `created: false`. Every
+   * later `kind=user` registration binds codes to this user (C.1).
+   */
+  async ensureUser(params: { pluginId: string }): Promise<EnsureUserResult> {
+    const body = (await this.request("POST", "/user/ensure", {
+      auth: true,
+      body: { plugin_id: params.pluginId },
+    })) as Record<string, unknown>;
+    return { userId: String(body.user_id), created: Boolean(body.created) };
+  }
+
+  /**
+   * Reserve a pairing code (PROTOCOL C.1). `kind="user"` (default) requires a
+   * `pluginId`; the registrar binds the code AT REGISTRATION to the user
+   * `/user/ensure` created for that plugin (400 if setup never ran).
+   * `kind="plugin"` omits it (the registrar issues a new plugin_id at redeem).
+   * `reusable` codes (kind=user only) redeem repeatedly until expiry, each
+   * redeem adding another device; `ttlSeconds` may go up to 2 years.
    */
   async registerPairing(params: {
     code: string;
@@ -134,6 +186,7 @@ export class RegistrarClient {
     pluginId?: string | undefined;
     userId?: string | undefined;
     ttlSeconds?: number | undefined;
+    reusable?: boolean | undefined;
   }): Promise<PairRegisterResult> {
     const body = (await this.request("POST", "/pair/register", {
       auth: true,
@@ -143,6 +196,7 @@ export class RegistrarClient {
         plugin_id: params.pluginId,
         user_id: params.userId,
         ttl_seconds: params.ttlSeconds,
+        ...(params.reusable !== undefined ? { reusable: params.reusable } : {}),
       },
     })) as Record<string, unknown>;
     return { ok: Boolean(body.ok), expiresAt: Number(body.expires_at) };
@@ -203,7 +257,7 @@ export class RegistrarClient {
     };
   }
 
-  /** Poll pairing completion (plugin → registrar). */
+  /** Poll pairing completion (plugin → registrar, PROTOCOL C.3). */
   async getPairingStatus(code: string): Promise<PairStatusResult> {
     const body = (await this.request("GET", `/pair/status?code=${encodeURIComponent(code)}`, {
       auth: true,
@@ -212,6 +266,9 @@ export class RegistrarClient {
       status: String(body.status) as PairStatus,
       userId: typeof body.user_id === "string" ? body.user_id : undefined,
       clientId: typeof body.client_id === "string" ? body.client_id : undefined,
+      redeems: parseRedeems(body.redeems),
+      redeemedCount: typeof body.redeemed_count === "number" ? body.redeemed_count : 0,
+      expiresAt: typeof body.expires_at === "number" ? body.expires_at : undefined,
     };
   }
 
@@ -253,6 +310,23 @@ export class RegistrarClient {
   }
 }
 
+/** Decode the untrusted `redeems` array off a /pair/status body (C.3). */
+function parseRedeems(raw: unknown): PairRedeem[] {
+  if (!Array.isArray(raw)) return [];
+  const redeems: PairRedeem[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const r = entry as Record<string, unknown>;
+    if (typeof r.device_id !== "string") continue;
+    redeems.push({
+      deviceId: r.device_id,
+      clientId: typeof r.client_id === "string" ? r.client_id : undefined,
+      redeemedAt: typeof r.redeemed_at === "number" ? r.redeemed_at : 0,
+    });
+  }
+  return redeems;
+}
+
 function safeJsonParse(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -260,6 +334,9 @@ function safeJsonParse(text: string): unknown {
     return text;
   }
 }
+
+/** PROTOCOL C.1: `ttl_seconds` upper bound — 63 072 000 s = 2 years. */
+export const PAIR_CODE_TTL_MAX_SECONDS = 63_072_000;
 
 /**
  * Generate a pairing code: **exactly 6 uniformly-random digits** (PROTOCOL C.1/C.2).

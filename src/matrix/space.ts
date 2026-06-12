@@ -76,6 +76,8 @@ function isJoined(client: MatrixClient, roomId: string | undefined): boolean {
   return Boolean(room && room.getMyMembership() === "join");
 }
 
+type IsJoinedFn = (roomId: string | undefined) => boolean;
+
 function encryptionState(): NonNullable<ICreateRoomOpts["initial_state"]>[number] {
   return { type: ROOM_ENCRYPTION, state_key: "", content: { algorithm: "m.megolm.v1.aes-sha2" } };
 }
@@ -98,27 +100,32 @@ async function linkChild(
 }
 
 /**
- * Ensure the plugin's space and its single control room exist; create them on
- * first run. Idempotent — reuses persisted ids when still joined.
+ * Shared create-what's-missing core for {@link ensurePluginRooms} (gateway,
+ * synced state) and {@link ensurePluginRoomsViaApi} (setup, /joined_rooms).
+ * PROTOCOL C.6 step 3: both the space and the control room get
+ * `m.room.encryption` at creation; only the control room is marked
+ * `chat4000.room_kind: control`, and it carries a human-readable name (E).
  */
-export async function ensurePluginRooms(
+async function ensureRoomsWith(
   client: MatrixClient,
   params: { accountId: string; pluginName: string },
+  joined: IsJoinedFn,
 ): Promise<PluginRooms> {
   const stored = readPluginRooms(params.accountId);
 
-  let spaceId = isJoined(client, stored.spaceId) ? stored.spaceId : undefined;
+  let spaceId = joined(stored.spaceId) ? stored.spaceId : undefined;
   if (!spaceId) {
     const res = await client.createRoom({
       name: params.pluginName,
       preset: Preset.PrivateChat,
       visibility: Visibility.Private,
       creation_content: { type: "m.space" },
+      initial_state: [encryptionState()],
     });
     spaceId = res.room_id;
   }
 
-  let controlRoomId = isJoined(client, stored.controlRoomId) ? stored.controlRoomId : undefined;
+  let controlRoomId = joined(stored.controlRoomId) ? stored.controlRoomId : undefined;
   if (!controlRoomId) {
     const res = await client.createRoom({
       name: "Commands",
@@ -133,6 +140,33 @@ export async function ensurePluginRooms(
   const rooms: PluginRooms = { spaceId, controlRoomId };
   saveRooms(params.accountId, rooms);
   return rooms;
+}
+
+/**
+ * Ensure the plugin's space and its single control room exist; create them on
+ * first run. Idempotent — reuses persisted ids when still joined.
+ */
+export async function ensurePluginRooms(
+  client: MatrixClient,
+  params: { accountId: string; pluginName: string },
+): Promise<PluginRooms> {
+  return ensureRoomsWith(client, params, (roomId) => isJoined(client, roomId));
+}
+
+/**
+ * Setup-time variant of {@link ensurePluginRooms} for a short-lived,
+ * NON-SYNCING bot session (PROTOCOL C.6 step 3): membership of the persisted
+ * room ids is verified with one `GET /joined_rooms` call instead of synced
+ * state, so re-running setup reuses the existing rooms and never spawns
+ * duplicates.
+ */
+export async function ensurePluginRoomsViaApi(
+  client: MatrixClient,
+  params: { accountId: string; pluginName: string },
+): Promise<PluginRooms> {
+  const { joined_rooms } = await client.getJoinedRooms();
+  const joinedSet = new Set(joined_rooms);
+  return ensureRoomsWith(client, params, (roomId) => Boolean(roomId && joinedSet.has(roomId)));
 }
 
 /**

@@ -1,111 +1,72 @@
 /**
- * Room creation + invite for the pairing flow (PROTOCOL C.3).
+ * Setup-time room creation + invites (PROTOCOL C.6 step 3).
  *
- * When a device redeems a pairing code, "the plugin invites user_id to its space
- * and session rooms." Minimal correct behavior: the plugin creates an encrypted
- * room and invites the freshly-paired user so messages can flow immediately.
+ * Setup opens a SHORT-LIVED Matrix session as the bot, creates the workspace
+ * space and the control room (both `m.room.encryption` at creation, the control
+ * room marked `chat4000.room_kind: control`), and invites the plugin's one user
+ * to both — all BEFORE any device pairs, so pairing completion never needs an
+ * invite (a redeemed device inherits its user's memberships).
  *
- * Like the live channel, this reaches the homeserver ONLY through the WS gateway
- * (PROTOCOL D) — there is no direct homeserver URL. createRoom + invite are
- * plaintext C-S calls, so a short-lived transport (no crypto init) is enough;
- * the room is flagged encrypted so the gateway's full client uses Megolm for the
- * actual messages.
+ * Single-crypto-owner rule (C.6): this session NEVER initializes or touches
+ * Olm/Megolm state — there is deliberately no `initRustCrypto` here. Creating
+ * rooms, setting `m.room.encryption` (cleartext room *config*), and inviting
+ * are plaintext C-S calls; room *keying* is done exclusively by the live plugin
+ * in the gateway on its next send after a device joins.
+ *
+ * Like the live channel, this reaches the homeserver ONLY through the WS
+ * gateway (PROTOCOL D) — there is no direct homeserver URL.
  */
-import { createClient, EventType, Preset, Visibility } from "matrix-js-sdk";
+import { createClient, type MatrixClient } from "matrix-js-sdk";
 import { GatewayTransport, gatewayToBaseUrl } from "./gateway-transport.js";
-import { ensureInitialSession } from "./space.js";
+import { ensurePluginRoomsViaApi, type PluginRooms } from "./space.js";
 import type { MatrixCredentials } from "./types.js";
 
-export type CreatePairedRoomResult = {
-  roomId: string;
-};
+export type SetupPluginRoomsResult = PluginRooms;
 
 /**
- * Create an encrypted direct room owned by the plugin and invite `inviteUserId`.
- * Returns the new room id.
+ * Matrix rejects an invite for a user who is already invited/joined with
+ * `M_FORBIDDEN` ("... is already in the room" / "already invited"). Setup is
+ * idempotent (C.6), so that answer means the invite already exists — success.
  */
-export async function createPairedRoom(params: {
-  credentials: MatrixCredentials;
-  inviteUserId: string;
-  name?: string;
-}): Promise<CreatePairedRoomResult> {
-  const transport = new GatewayTransport({
-    gatewayUrl: params.credentials.gatewayUrl,
-    accessToken: params.credentials.accessToken,
-  });
-  await transport.connect();
-  const client = createClient({
-    baseUrl: gatewayToBaseUrl(params.credentials.gatewayUrl),
-    accessToken: params.credentials.accessToken,
-    userId: params.credentials.userId,
-    deviceId: params.credentials.deviceId,
-    fetchFn: transport.fetch,
-  });
-
-  try {
-    const res = await client.createRoom({
-      preset: Preset.TrustedPrivateChat,
-      visibility: Visibility.Private,
-      is_direct: true,
-      invite: [params.inviteUserId],
-      ...(params.name ? { name: params.name } : {}),
-      initial_state: [
-        {
-          type: EventType.RoomEncryption,
-          state_key: "",
-          content: { algorithm: "m.megolm.v1.aes-sha2" },
-        },
-      ],
-    });
-    return { roomId: res.room_id };
-  } finally {
-    transport.dispose();
-  }
+function isAlreadyMemberError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /already\s+(in the room|invited|joined|a member)/i.test(message);
 }
 
 /**
- * Invite a user into a set of existing rooms over a short-lived gateway client
- * (no crypto — invites are plaintext C-S calls). Used by the pairing flow to add
- * the paired user to the plugin's control room + space (PROTOCOL E).
+ * Core of {@link setupPluginRooms}, taking an already-connected client so unit
+ * tests can drive it without a live gateway: ensure the space + control room
+ * exist (idempotent, via /joined_rooms) and invite `userId` to both.
  */
-export async function inviteUserToRooms(params: {
-  credentials: MatrixCredentials;
-  roomIds: string[];
-  userId: string;
-}): Promise<void> {
-  const transport = new GatewayTransport({
-    gatewayUrl: params.credentials.gatewayUrl,
-    accessToken: params.credentials.accessToken,
+export async function setupPluginRoomsWithClient(
+  client: MatrixClient,
+  params: { accountId: string; pluginName: string; userId: string },
+): Promise<SetupPluginRoomsResult> {
+  const rooms = await ensurePluginRoomsViaApi(client, {
+    accountId: params.accountId,
+    pluginName: params.pluginName,
   });
-  await transport.connect();
-  const client = createClient({
-    baseUrl: gatewayToBaseUrl(params.credentials.gatewayUrl),
-    accessToken: params.credentials.accessToken,
-    userId: params.credentials.userId,
-    deviceId: params.credentials.deviceId,
-    fetchFn: transport.fetch,
-  });
-  try {
-    for (const roomId of params.roomIds) {
+  for (const roomId of [rooms.spaceId, rooms.controlRoomId]) {
+    try {
       await client.invite(roomId, params.userId);
+    } catch (err) {
+      if (!isAlreadyMemberError(err)) throw err;
     }
-  } finally {
-    transport.dispose();
   }
+  return rooms;
 }
 
 /**
- * Auto-create the user's initial session room at pairing time over a short-lived
- * gateway client (PROTOCOL E auto-create). Only possible once the plugin's space
- * exists (the gateway creates it on boot); deduped via the onboarded store.
- * Returns the new room id, or null when the user already has one.
+ * PROTOCOL C.6 step 3: over a short-lived gateway session (no crypto — see
+ * module doc), create the plugin's space + control room and invite the
+ * plugin's one user to both. Idempotent on re-run.
  */
-export async function ensureInitialSessionForUser(params: {
+export async function setupPluginRooms(params: {
   credentials: MatrixCredentials;
   accountId: string;
-  spaceId: string;
+  pluginName: string;
   userId: string;
-}): Promise<string | null> {
+}): Promise<SetupPluginRoomsResult> {
   const transport = new GatewayTransport({
     gatewayUrl: params.credentials.gatewayUrl,
     accessToken: params.credentials.accessToken,
@@ -119,9 +80,9 @@ export async function ensureInitialSessionForUser(params: {
     fetchFn: transport.fetch,
   });
   try {
-    return await ensureInitialSession(client, {
-      spaceId: params.spaceId,
+    return await setupPluginRoomsWithClient(client, {
       accountId: params.accountId,
+      pluginName: params.pluginName,
       userId: params.userId,
     });
   } finally {

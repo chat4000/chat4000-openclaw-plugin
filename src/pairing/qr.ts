@@ -1,11 +1,11 @@
 /**
- * Human-device pairing (PROTOCOL §3).
+ * Human-device pairing (PROTOCOL C.1-C.3).
  *
  * The plugin picks a pairing `code`, registers it with the registrar
  * (`/pair/register`, bearer SERVICE_TOKEN), and prints it (text + QR). The
- * chat4000 app redeems the code at the registrar (`/pair/redeem`) and is logged
- * in. The plugin polls `/pair/status` until `completed`, then (§3.3) invites the
- * returned `user_id` to a room so messages can flow.
+ * chat4000 app redeems the code at the registrar (`/pair/redeem`) and becomes
+ * a device on the plugin's one user (C.1 binding). Nothing membership-wise
+ * happens at completion — the user's invites pre-exist from setup (C.6).
  *
  * The QR encodes a UNIVERSAL https link (not a custom scheme) so any phone
  * camera app can scan it: it opens pair.chat4000.com, which deep-links into the
@@ -30,6 +30,8 @@ export async function startHumanPairing(params: {
   pluginId: string;
   ttlSeconds?: number;
   userId?: string;
+  /** PROTOCOL C.1: redeemable many times until expiry (fleet enrollment). */
+  reusable?: boolean;
 }): Promise<StartHumanPairingResult> {
   const code = generatePairingCode();
   const result = await params.registrar.registerPairing({
@@ -37,6 +39,7 @@ export async function startHumanPairing(params: {
     pluginId: params.pluginId,
     userId: params.userId,
     ttlSeconds: params.ttlSeconds,
+    reusable: params.reusable,
   });
   return {
     code,

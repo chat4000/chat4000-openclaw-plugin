@@ -331,7 +331,11 @@ export const chat4000Plugin = {
             runtimeLogger,
           }).catch((err: unknown) => report(err, "channel.ensureInitialSessions"));
 
-          // PROTOCOL E: device-to-device pairing. Needs a registrar (provisioning
+          // PROTOCOL C.4 "Completion listening" + E device pairing: the
+          // gateway-resident listener owns pairing completion — it polls
+          // /pair/status for every outstanding code (CLI-registered ones
+          // included, surviving restarts via the persistent store) and handles
+          // interactive device.pair_* commands. Needs a registrar (provisioning
           // config) + the plugin id; without them the device.pair_* commands
           // answer "unavailable".
           const provisioning = ctx.account.provisioning;
@@ -340,23 +344,36 @@ export const chat4000Plugin = {
               baseUrl: provisioning.url,
               serviceToken: provisioning.serviceToken,
             });
-            devicePairingManagers.set(
-              ctx.account.accountId,
-              new DevicePairingManager({
-                registrar,
-                pluginId: ctx.account.pluginId,
-                sendPairStatus: async (pairId, state, error) => {
-                  const control = handle.controlRoomId;
-                  if (control) await sendPairStatus(handle.client, control, { pairId, state, error });
-                },
-                onCompleted: (clientId) => {
-                  // PL4: machine↔phone join for the newly-paired device.
-                  if (clientId) registerPairedClientId(clientId);
-                  track("pairing_completed", clientId ? { paired_client_id: clientId } : {});
-                },
-                report,
-              }),
-            );
+            const manager = new DevicePairingManager({
+              accountId: ctx.account.accountId,
+              registrar,
+              pluginId: ctx.account.pluginId,
+              sendPairStatus: async (pairId, state, error) => {
+                const control = handle.controlRoomId;
+                if (control) await sendPairStatus(handle.client, control, { pairId, state, error });
+              },
+              onDeviceRedeemed: ({ userId, clientId }) => {
+                // PL4: machine↔phone join, once per redeemed device.
+                if (clientId) registerPairedClientId(clientId);
+                track("pairing_completed", clientId ? { paired_client_id: clientId } : {});
+                // PROTOCOL C.3: membership needs nothing (invites pre-exist
+                // from setup) and KEYING rides the normal next-send key share
+                // (C.6 single-crypto-owner) — but a brand-new user still gets
+                // their first session room auto-created (E; deduped).
+                if (userId && handle.spaceId) {
+                  ensureInitialSession(handle.client, {
+                    spaceId: handle.spaceId,
+                    accountId: ctx.account.accountId,
+                    userId,
+                  }).catch((err: unknown) => report(err, "channel.ensureInitialSession"));
+                }
+              },
+              report,
+            });
+            devicePairingManagers.set(ctx.account.accountId, manager);
+            // Resume polling every outstanding code from the persistent store
+            // (codes registered before a restart, or by the CLI at install).
+            manager.resume();
           }
         } catch (err) {
           ctx.log?.warn?.(

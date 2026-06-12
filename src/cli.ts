@@ -5,13 +5,20 @@ import { dumpChat4000Trace } from "./error-log.js";
 import { deleteMatrixCredentials } from "./matrix/credentials.js";
 import type { MatrixCredentials } from "./matrix/types.js";
 import { configureIdentity, selfRedeemIdentity } from "./pairing/bot-identity.js";
-import { createPairedRoom, ensureInitialSessionForUser, inviteUserToRooms } from "./matrix/rooms.js";
-import { readPluginRooms } from "./matrix/space.js";
+import { setupPluginRooms } from "./matrix/rooms.js";
 import { endpointsForEnv, resolveEnv, type Chat4000Env } from "./pairing/env.js";
 import { getOrCreatePluginId } from "./pairing/instance.js";
 import {
+  addOutstandingCode,
+  recordRedeemedDevices,
+  removeOutstandingCode,
+} from "./pairing/outstanding-codes.js";
+import {
   isTransientRegistrarError,
+  PAIR_CODE_TTL_MAX_SECONDS,
   RegistrarClient,
+  RegistrarError,
+  type EnsureUserResult,
   type PairStatusResult,
 } from "./pairing/registrar.js";
 import { checkPluginVersion, formatVersionNotice } from "./pairing/version-check.js";
@@ -94,6 +101,7 @@ type PairCommandOptions = {
   registrarUrl?: string;
   serviceToken?: string;
   ttl?: string;
+  reusable?: boolean | undefined;
 };
 
 type WizardCommandOptions = {
@@ -168,16 +176,22 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .option("--stage", "Shortcut for --env stage")
         .option("--registrar-url <url>", "Registrar base URL (overrides env preset)")
         .option("--service-token <token>", "Registrar SERVICE_TOKEN")
-        .option("--ttl <seconds>", "Pairing code lifetime in seconds", "300")
+        .option(
+          "--ttl <seconds>",
+          "Pairing code lifetime in seconds (up to 63072000 = 2 years)",
+          "300",
+        )
+        .option(
+          "--reusable",
+          "Code can be redeemed many times until expiry, each redeem adding a device",
+        )
         .action(async (opts: PairCommandOptions) => {
           await runPair(api, opts).catch(handleCliError);
         });
 
       chat4000
         .command("wizard")
-        .description(
-          "Guided install: mint identity, (re)start the gateway, and pair a device",
-        )
+        .description("Guided install: mint identity, (re)start the gateway, and pair a device")
         .option("--account <id>", "Account id", "default")
         .option("--env <name>", "Backend environment: prod | stage")
         .option("--stage", "Shortcut for --env stage")
@@ -427,8 +441,20 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   const env = resolveSelectedEnv(opts);
   const gatewayUrl = resolveGatewayUrl(account, opts);
 
+  // PROTOCOL C.6: setup is bot self-onboard (step 1) → /user/ensure (step 2) →
+  // rooms + invites over a short-lived bot session (step 3). Steps 2+3 run on
+  // BOTH identity paths, so the registrar client is resolved up front; the C.5
+  // version policy is checked once, right before the first privileged call.
+  const { client: registrarClient } = resolveRegistrar(account, opts);
+  let versionChecked = false;
+  const checkVersionOnce = async (): Promise<void> => {
+    if (versionChecked) return;
+    versionChecked = true;
+    await enforceVersionBeforePrivileged(registrarClient, account.config.releaseChannel);
+  };
+
   // Bot identity: either operator-supplied direct credentials, or self-onboard
-  // via a kind=plugin registrar code (PROTOCOL C).
+  // via a kind=plugin registrar code (PROTOCOL C) — C.6 step 1.
   const directUserId = opts.userId?.trim() || account.userId;
   const directToken = opts.accessToken?.trim() || account.accessToken;
   const directDeviceId = opts.deviceId?.trim() || account.deviceId;
@@ -451,12 +477,11 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
     credentialsPath = result.credentialsPath;
     output.write(`✓ Configured Matrix identity: ${credentials.userId}\n`);
   } else if (opts.selfRedeem) {
-    const { client } = resolveRegistrar(account, opts);
-    await enforceVersionBeforePrivileged(client, account.config.releaseChannel);
+    await checkVersionOnce();
     output.write(`Self-onboarding a Matrix bot identity via the registrar (${env})...\n`);
     const result = await selfRedeemIdentity({
       accountId: account.accountId,
-      registrar: client,
+      registrar: registrarClient,
       gatewayUrl,
     });
     credentials = result.credentials;
@@ -470,6 +495,39 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
     );
   }
   output.write(`  Credentials: ${credentialsPath}\n`);
+
+  // PROTOCOL C.6 step 2: create (or get) the plugin's ONE user. Idempotent per
+  // plugin_id — re-running setup returns the same user, never a second one.
+  await checkVersionOnce();
+  const pluginId = credentials.pluginId ?? getOrCreatePluginId(account.accountId);
+  let ensured: EnsureUserResult;
+  try {
+    ensured = await registrarClient.ensureUser({ pluginId });
+  } catch (err) {
+    if (err instanceof RegistrarError && err.status === 400) {
+      throw new Error(
+        `registrar rejected plugin_id ${pluginId}: ${err.message}. The registrar only ` +
+          "knows plugin ids it issued at a kind=plugin redeem — re-run " +
+          '"openclaw chat4000 setup --self-redeem" to mint a registrar-issued identity.',
+      );
+    }
+    throw err;
+  }
+  output.write(`✓ Plugin user ${ensured.created ? "created" : "ready"}: ${ensured.userId}\n`);
+
+  // PROTOCOL C.6 step 3: short-lived bot session creates the space + control
+  // room and invites the user to both — BEFORE any device pairs. No key
+  // pre-sharing, ever (single-crypto-owner rule). Idempotent on re-run.
+  const rooms = await setupPluginRooms({
+    credentials,
+    accountId: account.accountId,
+    pluginName: "chat4000",
+    userId: ensured.userId,
+  });
+  output.write(
+    `✓ Space + control room ready (${rooms.spaceId}, ${rooms.controlRoomId}); ` +
+      `invited ${ensured.userId} to both.\n`,
+  );
 
   await writeChannelConfig(api, {
     accountId: account.accountId,
@@ -495,6 +553,12 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
 const PAIR_STATUS_POLL_INTERVAL_MS = 2_000;
 /** Exponential-backoff cap for transient /pair/status failures. */
 const PAIR_STATUS_MAX_BACKOFF_MS = 30_000;
+/**
+ * PROTOCOL C.4: the CLI watcher is only the immediate-feedback path while the
+ * install session is open — the gateway-resident listener owns the code's whole
+ * lifetime. So the CLI never watches longer than this, however long the TTL.
+ */
+const CLI_WATCH_MAX_SECONDS = 900;
 
 async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<void> {
   const cfg = loadConfig(api);
@@ -508,24 +572,57 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   const { client } = resolveRegistrar(account, opts);
   await enforceVersionBeforePrivileged(client, account.config.releaseChannel);
   const pluginId = account.pluginId ?? getOrCreatePluginId(account.accountId);
-  const ttlSeconds = Math.max(1, Math.min(3600, Number.parseInt(opts.ttl ?? "300", 10) || 300));
+  // PROTOCOL C.1: ttl_seconds may go up to 2 years (63 072 000 s).
+  const ttlSeconds = Math.max(
+    1,
+    Math.min(PAIR_CODE_TTL_MAX_SECONDS, Number.parseInt(opts.ttl ?? "300", 10) || 300),
+  );
+  const reusable = opts.reusable === true;
 
-  const pairing = await startHumanPairing({
-    registrar: client,
-    pluginId,
-    ttlSeconds,
+  let pairing;
+  try {
+    pairing = await startHumanPairing({
+      registrar: client,
+      pluginId,
+      ttlSeconds,
+      reusable,
+    });
+  } catch (err) {
+    if (err instanceof RegistrarError && err.status === 400) {
+      // C.1: registration requires the plugin's user to exist (bound at
+      // registration) — /user/ensure runs at setup.
+      throw new Error(
+        `registrar rejected the pairing registration: ${err.message}. ` +
+          'Run "openclaw chat4000 setup" first so the plugin\'s user exists (PROTOCOL C.6).',
+      );
+    }
+    throw err;
+  }
+  // C.4 completion listening: the code is part of the plugin's persistent
+  // state from the moment it exists — the gateway-resident listener polls it
+  // for its whole lifetime, even after this CLI exits.
+  addOutstandingCode(account.accountId, {
+    code: pairing.code,
+    reusable,
+    expiresAt: pairing.expiresAt,
+    registeredAt: Date.now(),
+    deviceIds: [],
   });
   output.write(`Pairing code: ${pairing.code}\n`);
   await renderQr(pairing.qrUri, (line) => output.write(`${line}\n`));
   output.write(`Redeem in the chat4000 app within ${ttlSeconds}s.\n`);
+  if (reusable) {
+    output.write("Code is reusable: each redeem adds another device until it expires.\n");
+  }
 
-  // Poll /pair/status until completed or expired. Transient registrar failures
+  // Poll /pair/status for install-time feedback. Transient registrar failures
   // (429 rate limits, 502/503/504, network errors) must NOT kill pairing —
   // observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED from /pair/status killed
   // the Hermes twin of this flow mid-pairing. They retry with exponential
   // backoff (2s doubling to a 30s cap) inside the same overall deadline; other
   // 4xx (bad token, unknown code, …) are permanent and fail fast.
-  const deadline = Date.now() + ttlSeconds * 1000;
+  const watchSeconds = Math.min(ttlSeconds, CLI_WATCH_MAX_SECONDS);
+  const deadline = Date.now() + watchSeconds * 1000;
   let pollDelayMs = PAIR_STATUS_POLL_INTERVAL_MS;
   while (Date.now() < deadline) {
     await sleep(Math.min(pollDelayMs, deadline - Date.now()));
@@ -540,69 +637,50 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
       throw error; // permanent registrar error — surfaced via handleCliError
     }
     pollDelayMs = PAIR_STATUS_POLL_INTERVAL_MS; // a successful poll resets the backoff
-    if (status.status === "completed") {
+    // C.3: a watcher waiting for "someone paired" checks `redeems` non-empty,
+    // not `status` — a reusable code stays `pending` however many redeems it
+    // has. Old-registrar fallback: `completed` with no redeems[] still counts.
+    let redeems = status.redeems;
+    if (redeems.length === 0 && status.status === "completed") {
+      redeems = [{ deviceId: `legacy:${pairing.code}`, clientId: status.clientId, redeemedAt: 0 }];
+    }
+    // Check-and-set against the shared store so the resident listener and this
+    // watcher never double-count a redeem (whoever records it, reports it).
+    const fresh = recordRedeemedDevices(account.accountId, pairing.code, redeems);
+    for (const redeem of fresh) {
       // PL4 / FLW2-4: the registrar hands us the redeeming phone's client_id —
       // emit the machine↔phone join event and register the super property
       // (latest pairing wins). Absent on old registrars / telemetry-off phones.
-      const pairedClientId = status.clientId?.trim();
+      const pairedClientId = redeem.clientId?.trim();
       if (pairedClientId) registerPairedClientId(pairedClientId);
       // PL4: the canonical prop is paired_client_id only (absent on old
       // registrars / telemetry-off phones; the event still counts the join).
       track("pairing_completed", pairedClientId ? { paired_client_id: pairedClientId } : {});
-      await flushAnalytics();
+    }
+    if (fresh.length > 0) await flushAnalytics();
+    if (redeems.length > 0) {
+      // PROTOCOL C.3: nothing to do membership-wise — the user's invites to the
+      // space + control room pre-exist from setup (C.6) and the new device
+      // inherits them; room keying happens on the plugin's next send.
       output.write(`✓ Device paired${status.userId ? ` (${status.userId})` : ""}.\n`);
-      // PROTOCOL C.3 + E: on completion the plugin invites the user into its
-      // control room + space (created by the gateway). If the gateway hasn't
-      // created them yet, fall back to a DM so messages can still flow.
-      if (status.userId) {
-        const credentials = {
-          gatewayUrl: account.gatewayUrl,
-          userId: account.userId,
-          accessToken: account.accessToken,
-          deviceId: account.deviceId,
-          pluginId: account.pluginId,
-        };
-        const rooms = readPluginRooms(account.accountId);
-        try {
-          if (rooms.spaceId && rooms.controlRoomId) {
-            await inviteUserToRooms({
-              credentials,
-              roomIds: [rooms.controlRoomId, rooms.spaceId],
-              userId: status.userId,
-            });
-            output.write(`✓ Invited ${status.userId} to the control room + space.\n`);
-            // PROTOCOL E: auto-create their first session room so a fresh device
-            // has a conversation without pressing "New Session" (deduped).
-            const sessionRoom = await ensureInitialSessionForUser({
-              credentials,
-              accountId: account.accountId,
-              spaceId: rooms.spaceId,
-              userId: status.userId,
-            });
-            if (sessionRoom) output.write(`✓ Created your first session room.\n`);
-          } else {
-            const room = await createPairedRoom({
-              credentials,
-              inviteUserId: status.userId,
-              name: "chat4000",
-            });
-            output.write(`✓ Created room ${room.roomId} and invited ${status.userId}.\n`);
-            output.write("  Start the gateway to create the plugin's control room + space.\n");
-          }
-        } catch (err) {
-          output.write(`⚠ Paired, but inviting the user failed: ${String(err)}\n`);
-          output.write("  The gateway will reconcile once it's running.\n");
-        }
+      if (status.status === "completed") {
+        removeOutstandingCode(account.accountId, pairing.code);
+      } else if (reusable) {
+        output.write(
+          "Code stays redeemable until expiry; the gateway keeps listening for more devices.\n",
+        );
       }
       return;
     }
     if (status.status === "expired") {
+      removeOutstandingCode(account.accountId, pairing.code);
       output.write('Pairing code expired. Re-run "openclaw chat4000 pair".\n');
       return;
     }
   }
   output.write(
-    'Pairing window elapsed. If the device didn\'t join, re-run "openclaw chat4000 pair".\n',
+    "Pairing window elapsed. The gateway keeps listening for this code until it " +
+      'expires; re-run "openclaw chat4000 pair" for a fresh code.\n',
   );
 }
 

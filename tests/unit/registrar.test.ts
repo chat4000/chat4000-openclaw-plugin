@@ -4,6 +4,7 @@ import {
   RegistrarError,
   generatePairingCode,
   isTransientRegistrarError,
+  type PairRedeem,
 } from "../../src/pairing/registrar.js";
 
 /** The request body in these tests is always a JSON string we set ourselves. */
@@ -92,7 +93,7 @@ describe("RegistrarClient", () => {
     expect(authHeader).toBeUndefined();
   });
 
-  it("getPairingStatus reports completion + user (PROTOCOL §3.3)", async () => {
+  it("getPairingStatus reports completion + user (PROTOCOL C.3)", async () => {
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
       serviceToken: "svc-token",
@@ -103,7 +104,14 @@ describe("RegistrarClient", () => {
     });
 
     const res = await client.getPairingStatus("ABC-123");
-    expect(res).toEqual({ status: "completed", userId: "@u_x:chat4000.com", clientId: undefined });
+    expect(res).toEqual({
+      status: "completed",
+      userId: "@u_x:chat4000.com",
+      clientId: undefined,
+      redeems: [],
+      redeemedCount: 0,
+      expiresAt: undefined,
+    });
   });
 
   it("getPairingStatus surfaces the redeeming phone's client_id when completed (FLW2)", async () => {
@@ -121,7 +129,96 @@ describe("RegistrarClient", () => {
       status: "completed",
       userId: "@u_x:chat4000.com",
       clientId: "phone-uuid",
+      redeems: [],
+      redeemedCount: 0,
+      expiresAt: undefined,
     });
+  });
+
+  it("getPairingStatus maps redeems[] + redeemed_count + expires_at (PROTOCOL C.3)", async () => {
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch(() => ({
+        status: 200,
+        body: {
+          // Reusable codes stay `pending` however many redeems they have.
+          status: "pending",
+          user_id: "@u_x:chat4000.com",
+          client_id: "phone-2",
+          redeems: [
+            { device_id: "DEV1", client_id: "phone-1", redeemed_at: 1700000001000 },
+            { device_id: "DEV2", redeemed_at: 1700000002000 },
+            "garbage", // tolerated: non-object entries are skipped
+          ],
+          redeemed_count: 25,
+          expires_at: 1750000000000,
+        },
+      })),
+    });
+
+    const res = await client.getPairingStatus("428913");
+    const expectedRedeems: PairRedeem[] = [
+      { deviceId: "DEV1", clientId: "phone-1", redeemedAt: 1700000001000 },
+      { deviceId: "DEV2", clientId: undefined, redeemedAt: 1700000002000 },
+    ];
+    expect(res).toEqual({
+      status: "pending",
+      userId: "@u_x:chat4000.com",
+      clientId: "phone-2",
+      redeems: expectedRedeems,
+      redeemedCount: 25,
+      expiresAt: 1750000000000,
+    });
+  });
+
+  it("registerPairing passes reusable + a 2-year ttl through (PROTOCOL C.1)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
+        return { status: 200, body: { ok: true, expires_at: 1750000000000 } };
+      }),
+    });
+
+    await client.registerPairing({
+      code: "428913",
+      pluginId: "plugin-uuid",
+      ttlSeconds: 63_072_000,
+      reusable: true,
+    });
+    expect(JSON.parse(bodyText(captured?.init.body))).toMatchObject({
+      code: "428913",
+      plugin_id: "plugin-uuid",
+      ttl_seconds: 63_072_000,
+      reusable: true,
+    });
+
+    // Single-use semantics unchanged when the flag is absent (C.1).
+    await client.registerPairing({ code: "428913", pluginId: "plugin-uuid" });
+    expect(JSON.parse(bodyText(captured?.init.body))).not.toHaveProperty("reusable");
+  });
+
+  it("ensureUser POSTs /user/ensure with bearer auth and maps the result (PROTOCOL C.6.1)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
+        return { status: 200, body: { user_id: "@u_x:chat4000.com", created: true } };
+      }),
+    });
+
+    const res = await client.ensureUser({ pluginId: "plugin-uuid" });
+    expect(res).toEqual({ userId: "@u_x:chat4000.com", created: true });
+    expect(captured?.url).toBe("https://registrar.chat4000.com/user/ensure");
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer svc-token",
+    );
+    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({ plugin_id: "plugin-uuid" });
   });
 
   it("checkVersion sends X-Client-Id when a clientId is given, omits it otherwise (PL3)", async () => {

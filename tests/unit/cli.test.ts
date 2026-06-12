@@ -7,6 +7,15 @@ import { registerChat4000Cli } from "../../src/cli.js";
 // Silence the ASCII QR (qrcode-terminal prints straight to the console).
 vi.mock("qrcode-terminal", () => ({ default: { generate: vi.fn() } }));
 
+// Setup's room creation (PROTOCOL C.6 step 3) needs a live gateway socket —
+// stub it; the room logic itself is unit-tested in setup-rooms.test.ts.
+const setupPluginRoomsMock = vi.fn(() =>
+  Promise.resolve({ spaceId: "!space:hs", controlRoomId: "!control:hs" }),
+);
+vi.mock("../../src/matrix/rooms.js", () => ({
+  setupPluginRooms: (...args: unknown[]) => setupPluginRoomsMock(...args),
+}));
+
 type ActionHandler = (...args: unknown[]) => unknown;
 
 /** Structural twin of the (unexported) CliCommand the host's Commander passes in. */
@@ -21,7 +30,7 @@ type FakeCommand = {
  * Register the real CLI against a fake Commander program and return the action
  * handlers keyed by command path (e.g. "chat4000 pair").
  */
-function captureCliActions(): Map<string, ActionHandler> {
+function captureCliActions(apiExtra: Record<string, unknown> = {}): Map<string, ActionHandler> {
   const actions = new Map<string, ActionHandler>();
   const makeNode = (parts: string[]): FakeCommand => {
     const node: FakeCommand = {
@@ -36,6 +45,7 @@ function captureCliActions(): Map<string, ActionHandler> {
     return node;
   };
   registerChat4000Cli({
+    ...apiExtra,
     registerCli: (registrar): void => {
       registrar({ program: makeNode([]), config: {} });
     },
@@ -47,6 +57,12 @@ function urlOf(input: string | URL | Request): string {
   if (typeof input === "string") return input;
   if (input instanceof URL) return input.toString();
   return input.url;
+}
+
+/** The request body in these tests is always a JSON string we set ourselves. */
+function bodyText(body: BodyInit | null | undefined): string {
+  if (typeof body !== "string") throw new Error("expected a string request body");
+  return body;
 }
 
 function jsonResponse(status: number, body: unknown): Promise<Response> {
@@ -81,6 +97,7 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     process.env.OPENCLAW_STATE_DIR = stateDir;
     for (const name of CRED_ENV_VARS) delete process.env[name];
     stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    setupPluginRoomsMock.mockClear();
   });
 
   afterEach(() => {
@@ -213,5 +230,112 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     expect(statusAttempts).toBe(1);
     expect(writtenOutput()).toContain("chat4000 error: Invalid service token");
     expect(process.exitCode).toBe(1);
+  });
+
+  // PROTOCOL C.1: a reusable code stays `pending` however many redeems it has —
+  // the watcher checks `redeems` non-empty, not `status` (C.3).
+  it("pair --reusable registers a reusable code and reports the first redeem while pending", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    configureEnvIdentity();
+    let registerBody: Record<string, unknown> | undefined;
+    let statusAttempts = 0;
+    const fetchMock = vi.fn(
+      (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = urlOf(input);
+        if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
+        if (url.includes("/pair/register")) {
+          registerBody = JSON.parse(bodyText(init?.body)) as Record<string, unknown>;
+          return jsonResponse(200, { ok: true, expires_at: Date.now() + 63_072_000_000 });
+        }
+        if (url.includes("/pair/status")) {
+          statusAttempts += 1;
+          return jsonResponse(200, {
+            status: "pending",
+            user_id: "@u_x:chat4000.com",
+            redeems: [{ device_id: "DEV1", client_id: "phone-1", redeemed_at: Date.now() }],
+            redeemed_count: 1,
+            expires_at: Date.now() + 63_072_000_000,
+          });
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const actions = captureCliActions();
+    const pair = actions.get("chat4000 pair");
+    expect(pair).toBeDefined();
+    // --ttl above the C.1 cap is clamped to 63 072 000 s (2 years).
+    const run = pair?.({ ttl: "99999999999", reusable: true });
+    for (let i = 0; i < 120 && statusAttempts < 1; i += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await run;
+    expect(registerBody).toMatchObject({ reusable: true, ttl_seconds: 63_072_000 });
+    expect(writtenOutput()).toContain("✓ Device paired (@u_x:chat4000.com)");
+    expect(writtenOutput()).toContain("Code stays redeemable until expiry");
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  // PROTOCOL C.6: setup = self-onboard → /user/ensure → rooms + invites, all
+  // BEFORE any device pairs. Idempotent: a re-run reuses the same user/rooms.
+  it("setup --self-redeem runs /user/ensure then creates rooms for that user (C.6), idempotently", async () => {
+    const calls: string[] = [];
+    let ensureCalls = 0;
+    const fetchMock = vi.fn((input: string | URL | Request): Promise<Response> => {
+      const url = urlOf(input);
+      if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
+      if (url.includes("/pair/register")) {
+        calls.push("register");
+        return jsonResponse(200, { ok: true, expires_at: Date.now() + 300_000 });
+      }
+      if (url.includes("/pair/redeem")) {
+        calls.push("redeem");
+        return jsonResponse(200, {
+          gateway_url: "wss://gateway.test.invalid/ws",
+          user_id: "@plugin_x:chat4000.com",
+          device_id: "BOTDEV",
+          access_token: "bot-token",
+          plugin_id: "11111111-1111-1111-1111-111111111111",
+        });
+      }
+      if (url.includes("/user/ensure")) {
+        calls.push("ensure");
+        ensureCalls += 1;
+        return jsonResponse(200, {
+          user_id: "@u_one:chat4000.com",
+          created: ensureCalls === 1, // idempotent repeat returns created:false
+        });
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const writeConfigFile = vi.fn(() => Promise.resolve());
+    const actions = captureCliActions({
+      runtime: { config: { loadConfig: (): Record<string, unknown> => ({}), writeConfigFile } },
+    });
+    const setup = actions.get("chat4000 setup");
+    expect(setup).toBeDefined();
+
+    await setup?.({ selfRedeem: true, noPair: true });
+    expect(process.exitCode).not.toBe(1);
+    // C.6 order: bot self-onboard (register+redeem) BEFORE /user/ensure.
+    expect(calls).toEqual(["register", "redeem", "ensure"]);
+    // Step 3 creates the rooms for the ensured user (invites pre-exist before pairing).
+    expect(setupPluginRoomsMock).toHaveBeenCalledTimes(1);
+    expect(setupPluginRoomsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: "@u_one:chat4000.com", pluginName: "chat4000" }),
+    );
+    expect(writtenOutput()).toContain("✓ Plugin user created: @u_one:chat4000.com");
+    expect(writtenOutput()).toContain("Skipped device pairing.");
+
+    // Re-run: same user comes back (created:false), rooms ensured again, no error.
+    await setup?.({ selfRedeem: true, noPair: true });
+    expect(process.exitCode).not.toBe(1);
+    expect(ensureCalls).toBe(2);
+    expect(setupPluginRoomsMock).toHaveBeenCalledTimes(2);
+    expect(writtenOutput()).toContain("✓ Plugin user ready: @u_one:chat4000.com");
   });
 });
