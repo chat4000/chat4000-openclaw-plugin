@@ -30,6 +30,7 @@ import {
   setTelemetryEnabled,
 } from "./telemetry.js";
 import { flushAnalytics, registerPairedClientId, track } from "./analytics.js";
+import { buildWizardEnvSummary, runWizard } from "./wizard.js";
 
 /**
  * Minimal structural view of the Commander `Command` the host passes in. Only
@@ -89,6 +90,18 @@ type PairCommandOptions = {
   registrarUrl?: string;
   serviceToken?: string;
   ttl?: string;
+};
+
+type WizardCommandOptions = {
+  account?: string;
+  env?: string;
+  stage?: boolean;
+  registrarUrl?: string;
+  serviceToken?: string;
+  gatewayUrl?: string;
+  ttl?: string;
+  pairingLogLevel?: "info" | "debug";
+  runtimeLogLevel?: "info" | "debug";
 };
 
 type MigrateCommandOptions = {
@@ -154,6 +167,24 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .option("--ttl <seconds>", "Pairing code lifetime in seconds", "300")
         .action(async (opts: PairCommandOptions) => {
           await runPair(api, opts).catch(handleCliError);
+        });
+
+      chat4000
+        .command("wizard")
+        .description(
+          "Guided install: mint identity, (re)start the gateway, and pair a device",
+        )
+        .option("--account <id>", "Account id", "default")
+        .option("--env <name>", "Backend environment: prod | stage")
+        .option("--stage", "Shortcut for --env stage")
+        .option("--registrar-url <url>", "Registrar base URL (overrides env preset)")
+        .option("--service-token <token>", "Registrar SERVICE_TOKEN")
+        .option("--gateway-url <url>", "WS gateway URL (overrides env preset)")
+        .option("--ttl <seconds>", "Pairing code lifetime in seconds", "300")
+        .option("--pairing-log-level <level>", "Pairing log level (info|debug)")
+        .option("--runtime-log-level <level>", "Runtime log level (info|debug)")
+        .action(async (opts: WizardCommandOptions) => {
+          await runWizardCommand(api, opts).catch(handleCliError);
         });
 
       chat4000
@@ -552,6 +583,49 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   output.write(
     'Pairing window elapsed. If the device didn\'t join, re-run "openclaw chat4000 pair".\n',
   );
+}
+
+async function runWizardCommand(api: PluginApiLike, opts: WizardCommandOptions): Promise<void> {
+  // Resolve the account up front so the banner can report whether an identity is
+  // already configured (and so the same accountId threads through every step).
+  const cfg = loadConfig(api);
+  const account = resolveChat4000Account({ cfg, accountId: opts.account });
+
+  // Build option objects that include only DEFINED keys — `exactOptionalPropertyTypes`
+  // rejects passing an explicit `undefined` for an optional field.
+  const setupOpts: SetupCommandOptions = {
+    account: account.accountId,
+    selfRedeem: true,
+    noPair: true,
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+    ...(opts.registrarUrl !== undefined ? { registrarUrl: opts.registrarUrl } : {}),
+    ...(opts.serviceToken !== undefined ? { serviceToken: opts.serviceToken } : {}),
+    ...(opts.gatewayUrl !== undefined ? { gatewayUrl: opts.gatewayUrl } : {}),
+    ...(opts.pairingLogLevel !== undefined ? { pairingLogLevel: opts.pairingLogLevel } : {}),
+    ...(opts.runtimeLogLevel !== undefined ? { runtimeLogLevel: opts.runtimeLogLevel } : {}),
+  };
+  const pairOpts: PairCommandOptions = {
+    account: account.accountId,
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
+    ...(opts.registrarUrl !== undefined ? { registrarUrl: opts.registrarUrl } : {}),
+    ...(opts.serviceToken !== undefined ? { serviceToken: opts.serviceToken } : {}),
+    ...(opts.ttl !== undefined ? { ttl: opts.ttl } : {}),
+  };
+
+  await runWizard({
+    envSummary: () =>
+      buildWizardEnvSummary({
+        envFlag: opts.stage ? "stage" : opts.env,
+        configured: account.configured,
+      }),
+    // Step 1: mint identity + enable the plugin, WITHOUT pairing — this repo's
+    // equivalent of the Hermes wizard's `prepare`. Reuses runSetup.
+    prepare: () => runSetup(api, setupOpts),
+    // Step 3: the human pairing handshake. Reuses runPair.
+    pair: () => runPair(api, pairOpts),
+  });
 }
 
 async function runMigrate(api: PluginApiLike, opts: MigrateCommandOptions): Promise<void> {
