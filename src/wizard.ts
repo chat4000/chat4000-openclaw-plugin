@@ -11,8 +11,8 @@
  *
  * Adaptations to OpenClaw (vs. the Hermes reference):
  *   - No venv. The wizard runs in-process and reuses the plugin's own setup/pair
- *     internals (`runWizardSetup` / `runWizardPair`) rather than shelling out to a
- *     sibling CLI binary.
+ *     internals (cli.ts `runSetup` / `runPair`, injected via `WizardDeps`) rather
+ *     than shelling out to a sibling CLI binary.
  *   - Identity is minted via `setup --self-redeem --no-pair` (this repo's
  *     equivalent of Hermes' `prepare`), reusing `selfRedeemIdentity`.
  *   - Gateway restart-method detection reuses the self-update preflight
