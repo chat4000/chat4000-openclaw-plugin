@@ -1,4 +1,5 @@
 import { loadMatrixCredentials } from "./matrix/credentials.js";
+import { DEFAULT_SERVICE_TOKEN } from "./pairing/env.js";
 import type {
   Chat4000Config,
   Chat4000ProvisioningConfig,
@@ -41,7 +42,7 @@ function resolveProvisioning(merged: Chat4000Config): Chat4000ProvisioningConfig
     trimmed(process.env.CHAT4000_SERVICE_TOKEN) ||
     trimmed(process.env.CHAT4000_PROVISIONING_API_KEY) ||
     trimmed(fromConfig.serviceToken) ||
-    "";
+    DEFAULT_SERVICE_TOKEN;
   return {
     url: url || undefined,
     serviceToken: serviceToken || undefined,

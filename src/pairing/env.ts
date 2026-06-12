@@ -18,6 +18,13 @@ export type EnvEndpoints = {
   gateway: string;
 };
 
+// Static shared service token. It gates pairing-code registration, status
+// polling, and plugin-version lookup (never content) — basic-auth-grade by
+// design: it ships in the client, so treat it as public. Same default the
+// Hermes plugin bakes in (registrar_config.py). Override with
+// CHAT4000_SERVICE_TOKEN, --service-token, or provisioning.serviceToken.
+export const DEFAULT_SERVICE_TOKEN = "chat4000_svc_72ee3b80a16f826a173c65450cadd107d5f6912d4d96135a";
+
 export const ENV_ENDPOINTS: Record<Chat4000Env, EnvEndpoints> = {
   prod: {
     registrar: "https://registrar.chat4000.com",
