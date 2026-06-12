@@ -211,6 +211,27 @@ export async function sendAgentStatus(
   await sendTimelineEvent(client, roomId, STATUS_EVENT_TYPE, content, txnId);
 }
 
+/**
+ * Send a device-pairing status update into the control room (PROTOCOL E device
+ * pairing). Mirrors the command-result shape; never wakes the user.
+ */
+export async function sendPairStatus(
+  client: MatrixClient,
+  roomId: string,
+  params: { pairId: string; state: string; error?: string | undefined },
+): Promise<string> {
+  const content: MatrixContent = {
+    msgtype: "chat4000.pair_status",
+    body: `pair ${params.pairId}: ${params.state}`,
+    pair_id: params.pairId,
+    state: params.state,
+    ...(params.error ? { error: params.error } : {}),
+  };
+  const txnId = client.makeTxnId();
+  markPush(txnId, false);
+  return sendTimelineEvent(client, roomId, EventType.RoomMessage, content, txnId);
+}
+
 /** Custom timeline event type for the HTML-card final answer (PROTOCOL E). */
 const HTML_CARD_EVENT_TYPE = "chat4000.html_card";
 

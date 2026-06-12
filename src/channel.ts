@@ -27,6 +27,7 @@ import {
   editToolEnd,
   sendAgentStatus,
   sendCommandResult,
+  sendPairStatus,
   sendText as matrixSendText,
   sendToolStart,
 } from "./matrix/send.js";
@@ -50,14 +51,19 @@ import { applyUpdate } from "./update/apply.js";
 import { reconcileUpdateMarker } from "./update/boot-guard.js";
 import { getChat4000SessionBinding } from "./session-binding.js";
 import { report } from "./telemetry.js";
-import { emitPluginBootAnalytics } from "./analytics.js";
+import { emitPluginBootAnalytics, registerPairedClientId, track } from "./analytics.js";
 import { snapshotContainerRebuilt } from "./machine-ids.js";
+import { DevicePairingManager } from "./device-pairing.js";
 import type { ResolvedChat4000Account } from "./types.js";
 
 // PL1: plugin_started fires once per gateway process (not per account, and not on
 // one-shot CLI commands). The IDN9 rebuild signal was snapshotted at module load
 // (index.ts) before the env-id file was minted.
 let pluginStartedEmitted = false;
+
+// PROTOCOL E device pairing: one manager per live account, created at gateway
+// boot (when a registrar is configured) and disposed at shutdown.
+const devicePairingManagers = new Map<string, DevicePairingManager>();
 
 type ReplyPipelineRuntime = {
   createChannelReplyPipeline: (params: {
@@ -324,6 +330,34 @@ export const chat4000Plugin = {
             botUserId: ctx.account.userId,
             runtimeLogger,
           }).catch((err: unknown) => report(err, "channel.ensureInitialSessions"));
+
+          // PROTOCOL E: device-to-device pairing. Needs a registrar (provisioning
+          // config) + the plugin id; without them the device.pair_* commands
+          // answer "unavailable".
+          const provisioning = ctx.account.provisioning;
+          if (provisioning.url && provisioning.serviceToken && ctx.account.pluginId) {
+            const registrar = new RegistrarClient({
+              baseUrl: provisioning.url,
+              serviceToken: provisioning.serviceToken,
+            });
+            devicePairingManagers.set(
+              ctx.account.accountId,
+              new DevicePairingManager({
+                registrar,
+                pluginId: ctx.account.pluginId,
+                sendPairStatus: async (pairId, state, error) => {
+                  const control = handle.controlRoomId;
+                  if (control) await sendPairStatus(handle.client, control, { pairId, state, error });
+                },
+                onCompleted: (clientId) => {
+                  // PL4: machine↔phone join for the newly-paired device.
+                  if (clientId) registerPairedClientId(clientId);
+                  track("pairing_completed", clientId ? { paired_client_id: clientId } : {});
+                },
+                report,
+              }),
+            );
+          }
         } catch (err) {
           ctx.log?.warn?.(
             `[${ctx.account.accountId}] could not ensure plugin rooms: ${String(err)}`,
@@ -340,6 +374,8 @@ export const chat4000Plugin = {
         ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
       });
       await handle.stop();
+      devicePairingManagers.get(ctx.account.accountId)?.dispose();
+      devicePairingManagers.delete(ctx.account.accountId);
       unregisterHandle(ctx.account.accountId);
     },
   },
@@ -450,14 +486,19 @@ async function handleCommand(params: {
     command: command.command,
     sender: command.senderId,
   });
-  const result = command.command.startsWith("session.")
-    ? await handleSessionCommand(command, handle)
-    : await handleControlCommand(
-        { command: command.command, args: command.args, senderId: command.senderId },
-        {
-          log: (line) => runtimeLogger.info("runtime.command_log", { detail: line }),
-        },
-      );
+  let result: CommandResult;
+  if (command.command.startsWith("session.")) {
+    result = await handleSessionCommand(command, handle);
+  } else if (command.command.startsWith("device.")) {
+    result = await handleDeviceCommand(command, params.ctx.accountId);
+  } else {
+    result = await handleControlCommand(
+      { command: command.command, args: command.args, senderId: command.senderId },
+      {
+        log: (line) => runtimeLogger.info("runtime.command_log", { detail: line }),
+      },
+    );
+  }
   try {
     await sendCommandResult(handle.client, command.roomId, result);
   } catch (err) {
@@ -532,6 +573,42 @@ async function handleSessionCommand(
   } catch (err) {
     return { command: command.command, ok: false, error: String(err) };
   }
+}
+
+/**
+ * PROTOCOL E device pairing: route `device.pair_start` / `device.pair_cancel` to
+ * the account's pairing manager. Answers "unavailable" when no registrar is
+ * configured (no manager was created at boot).
+ */
+async function handleDeviceCommand(
+  command: MatrixInboundCommand,
+  accountId: string,
+): Promise<CommandResult> {
+  const manager = devicePairingManagers.get(accountId);
+  if (!manager) {
+    return {
+      command: command.command,
+      ok: false,
+      error: "device pairing unavailable (no registrar configured)",
+    };
+  }
+  if (command.command === "device.pair_start") {
+    const res = await manager.start(command.senderId);
+    return res.ok
+      ? { command: command.command, ok: true, data: { pair_id: res.pairId, code: res.code } }
+      : { command: command.command, ok: false, error: res.error };
+  }
+  if (command.command === "device.pair_cancel") {
+    const pairId = typeof command.args.pair_id === "string" ? command.args.pair_id : "";
+    if (!pairId) {
+      return { command: command.command, ok: false, error: "device.pair_cancel needs pair_id" };
+    }
+    const res = manager.cancel(pairId);
+    return res.ok
+      ? { command: command.command, ok: true, data: { pair_id: pairId } }
+      : { command: command.command, ok: false, error: res.error };
+  }
+  return { command: command.command, ok: false, error: "unknown command" };
 }
 
 /**
