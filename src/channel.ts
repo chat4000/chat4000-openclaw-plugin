@@ -34,7 +34,13 @@ import { MatrixDraftStream } from "./matrix/streaming.js";
 import type { MatrixInboundMessage } from "./matrix/types.js";
 import { type CommandResult, handleControlCommand } from "./commands.js";
 import { downloadInboundMediaBuffer, roomIsEncrypted, sendMediaMessage } from "./matrix/media.js";
-import { archiveRoom, createSessionRoom, deleteSessionRoom, renameRoom } from "./matrix/space.js";
+import {
+  archiveRoom,
+  createSessionRoom,
+  deleteSessionRoom,
+  ensureInitialSession,
+  renameRoom,
+} from "./matrix/space.js";
 import { clearCardFinalized, consumeCardFinalized } from "./matrix/card-finalize.js";
 import { readPackageVersion } from "./package-info.js";
 import { RegistrarClient } from "./pairing/registrar.js";
@@ -308,6 +314,16 @@ export const chat4000Plugin = {
             space: handle.spaceId,
             control: handle.controlRoomId,
           });
+          // PROTOCOL E: auto-create an initial session room for each paired user
+          // in the control room, so their first chat works without pressing
+          // "New Session". Durable dedupe (onboarded store) prevents duplicates
+          // across restarts. Best-effort — never blocks channel startup.
+          await ensureInitialSessionsForControlRoom({
+            handle,
+            accountId: ctx.account.accountId,
+            botUserId: ctx.account.userId,
+            runtimeLogger,
+          }).catch((err: unknown) => report(err, "channel.ensureInitialSessions"));
         } catch (err) {
           ctx.log?.warn?.(
             `[${ctx.account.accountId}] could not ensure plugin rooms: ${String(err)}`,
@@ -515,6 +531,48 @@ async function handleSessionCommand(
     }
   } catch (err) {
     return { command: command.command, ok: false, error: String(err) };
+  }
+}
+
+/**
+ * PROTOCOL E: on gateway boot, auto-create one initial session room for each
+ * paired user already in the control room (membership join/invite, excluding the
+ * bot), so a freshly-paired device has a conversation without pressing "New
+ * Session". Deduped + durable via the onboarded store. Best-effort per user.
+ */
+async function ensureInitialSessionsForControlRoom(params: {
+  handle: MatrixClientHandle;
+  accountId: string;
+  botUserId: string;
+  runtimeLogger: RuntimeLogger;
+}): Promise<void> {
+  const { handle, accountId, botUserId, runtimeLogger } = params;
+  const spaceId = handle.spaceId;
+  const controlRoomId = handle.controlRoomId;
+  if (!spaceId || !controlRoomId) return;
+  const room = handle.client.getRoom(controlRoomId);
+  if (!room) return;
+  const members = room
+    .getMembers()
+    .filter(
+      (m) => m.userId !== botUserId && (m.membership === "join" || m.membership === "invite"),
+    );
+  for (const member of members) {
+    try {
+      const roomId = await ensureInitialSession(handle.client, {
+        spaceId,
+        accountId,
+        userId: member.userId,
+      });
+      if (roomId) {
+        runtimeLogger.info("runtime.initial_session_created", {
+          user: member.userId,
+          room: roomId,
+        });
+      }
+    } catch (err) {
+      report(err, "channel.ensureInitialSession");
+    }
   }
 }
 

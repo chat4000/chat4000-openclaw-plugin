@@ -17,6 +17,7 @@ import path from "node:path";
 import { resolveChat4000AccountStateDir } from "../paths.js";
 import { ROOM_KIND_STATE_EVENT } from "./inbound.js";
 import { sendCustomStateEvent } from "./sdk-boundary.js";
+import { isOnboarded, markOnboarded } from "./onboarded-store.js";
 
 const ROOM_ENCRYPTION = "m.room.encryption";
 const SPACE_CHILD = "m.space.child";
@@ -151,6 +152,28 @@ export async function createSessionRoom(
   });
   await linkChild(client, params.spaceId, res.room_id);
   return res.room_id;
+}
+
+/**
+ * Auto-create ONE initial session room for a paired user + invite them, so their
+ * first chat works without pressing "New Session" (PROTOCOL E; mirrors hermes
+ * `_ensure_initial_session`). Durable dedupe via the onboarded store: a restart
+ * that re-invites known users never mints a second initial room. Returns the new
+ * room id, or null when the user already has one (or has no id).
+ */
+export async function ensureInitialSession(
+  client: MatrixClient,
+  params: { spaceId: string; accountId: string; userId: string },
+): Promise<string | null> {
+  const userId = params.userId.trim();
+  if (!userId || isOnboarded(params.accountId, userId)) return null;
+  const roomId = await createSessionRoom(client, {
+    spaceId: params.spaceId,
+    title: "chat4000",
+    inviteUserId: userId,
+  });
+  markOnboarded(params.accountId, userId, roomId);
+  return roomId;
 }
 
 /** Rename a session room (`session.rename`). */

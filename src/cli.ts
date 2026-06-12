@@ -5,7 +5,7 @@ import { dumpChat4000Trace } from "./error-log.js";
 import { deleteMatrixCredentials } from "./matrix/credentials.js";
 import type { MatrixCredentials } from "./matrix/types.js";
 import { configureIdentity, selfRedeemIdentity } from "./pairing/bot-identity.js";
-import { createPairedRoom, inviteUserToRooms } from "./matrix/rooms.js";
+import { createPairedRoom, ensureInitialSessionForUser, inviteUserToRooms } from "./matrix/rooms.js";
 import { readPluginRooms } from "./matrix/space.js";
 import { endpointsForEnv, resolveEnv, type Chat4000Env } from "./pairing/env.js";
 import { getOrCreatePluginId } from "./pairing/instance.js";
@@ -516,6 +516,15 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
                 userId: status.userId,
               });
               output.write(`✓ Invited ${status.userId} to the control room + space.\n`);
+              // PROTOCOL E: auto-create their first session room so a fresh device
+              // has a conversation without pressing "New Session" (deduped).
+              const sessionRoom = await ensureInitialSessionForUser({
+                credentials,
+                accountId: account.accountId,
+                spaceId: rooms.spaceId,
+                userId: status.userId,
+              });
+              if (sessionRoom) output.write(`✓ Created your first session room.\n`);
             } else {
               const room = await createPairedRoom({
                 credentials,

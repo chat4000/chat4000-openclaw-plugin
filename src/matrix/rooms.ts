@@ -13,6 +13,7 @@
  */
 import { createClient, EventType, Preset, Visibility } from "matrix-js-sdk";
 import { GatewayTransport, gatewayToBaseUrl } from "./gateway-transport.js";
+import { ensureInitialSession } from "./space.js";
 import type { MatrixCredentials } from "./types.js";
 
 export type CreatePairedRoomResult = {
@@ -88,6 +89,41 @@ export async function inviteUserToRooms(params: {
     for (const roomId of params.roomIds) {
       await client.invite(roomId, params.userId);
     }
+  } finally {
+    transport.dispose();
+  }
+}
+
+/**
+ * Auto-create the user's initial session room at pairing time over a short-lived
+ * gateway client (PROTOCOL E auto-create). Only possible once the plugin's space
+ * exists (the gateway creates it on boot); deduped via the onboarded store.
+ * Returns the new room id, or null when the user already has one.
+ */
+export async function ensureInitialSessionForUser(params: {
+  credentials: MatrixCredentials;
+  accountId: string;
+  spaceId: string;
+  userId: string;
+}): Promise<string | null> {
+  const transport = new GatewayTransport({
+    gatewayUrl: params.credentials.gatewayUrl,
+    accessToken: params.credentials.accessToken,
+  });
+  await transport.connect();
+  const client = createClient({
+    baseUrl: gatewayToBaseUrl(params.credentials.gatewayUrl),
+    accessToken: params.credentials.accessToken,
+    userId: params.credentials.userId,
+    deviceId: params.credentials.deviceId,
+    fetchFn: transport.fetch,
+  });
+  try {
+    return await ensureInitialSession(client, {
+      spaceId: params.spaceId,
+      accountId: params.accountId,
+      userId: params.userId,
+    });
   } finally {
     transport.dispose();
   }
