@@ -68,6 +68,22 @@ export type PairStatusResult = {
   expiresAt?: number | undefined;
 };
 
+/**
+ * PL4 `redeem_index` derivation (registry-documented): `/pair/status` carries
+ * no per-entry index, so derive it from the wire fields —
+ * `redeemedCount − redeems.length + position + 1`, with `redeemedCount`
+ * falling back to `redeems.length` when absent/0. The old-registrar completed
+ * shape (no `redeems[]`) counts as the single first redeem → 1. Undefined when
+ * the entry can't be located (never fabricate).
+ */
+export function redeemIndexOf(status: PairStatusResult, deviceId: string): number | undefined {
+  if (status.redeems.length === 0) return status.status === "completed" ? 1 : undefined;
+  const pos = status.redeems.findIndex((r) => r.deviceId === deviceId);
+  if (pos === -1) return undefined;
+  const count = status.redeemedCount > 0 ? status.redeemedCount : status.redeems.length;
+  return count - status.redeems.length + pos + 1;
+}
+
 /** PROTOCOL C.6.1 `POST /user/ensure` result. */
 export type EnsureUserResult = {
   /** The plugin's one user MXID (registrar-generated). */

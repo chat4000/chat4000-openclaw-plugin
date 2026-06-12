@@ -27,6 +27,7 @@ import { randomBytes } from "node:crypto";
 import {
   generatePairingCode,
   isTransientRegistrarError,
+  redeemIndexOf,
   RegistrarError,
   type PairStatusResult,
   type RegistrarClient,
@@ -60,6 +61,10 @@ export type DeviceRedeem = {
   clientId?: string | undefined;
   /** The code's bound user (the plugin's one user, C.1). */
   userId?: string | undefined;
+  /** PL4: whether the redeemed code was reusable (C.1). */
+  reusable: boolean;
+  /** PL4: 1-based per-code redeem index, wire-derived; absent when underivable. */
+  redeemIndex?: number | undefined;
 };
 
 export type DevicePairingDeps = {
@@ -323,6 +328,8 @@ export class DevicePairingManager {
           deviceId: redeem.deviceId,
           clientId: redeem.clientId,
           userId: status.userId,
+          reusable: entry.reusable, // PL4 prop
+          redeemIndex: redeemIndexOf(status, redeem.deviceId), // PL4 prop (wire-derived)
         });
       } catch (err) {
         this.deps.report(err, "device_pairing.on_device_redeemed");

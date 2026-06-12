@@ -104,6 +104,8 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
       deviceId: "DEV9",
       clientId: "phone-1",
       userId: "@new:hs",
+      reusable: false, // PL4 prop — device.pair_start codes are single-use
+      redeemIndex: 1, // PL4 prop — wire-derived
     });
     expect(sendPairStatus).toHaveBeenCalledWith(expect.any(String), "completed");
     // A settled single-use code leaves the persistent store.
@@ -137,7 +139,13 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
     expect(res.ok).toBe(true);
     await done;
     expect(onDeviceRedeemed).toHaveBeenCalledWith(
-      expect.objectContaining({ clientId: "phone-1", userId: "@new:hs" }),
+      // PL4: the synthesized legacy redeem still counts as redeem 1.
+      expect.objectContaining({
+        clientId: "phone-1",
+        userId: "@new:hs",
+        reusable: false,
+        redeemIndex: 1,
+      }),
     );
     mgr.dispose();
   });
@@ -265,6 +273,8 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
         deviceId: "DEV1",
         clientId: "phone-1",
         userId: "@u_x:hs",
+        reusable: false,
+        redeemIndex: 1,
       },
     ]);
     // No pair_id → a CLI code has no control-room lifecycle events.
@@ -333,11 +343,15 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
       deviceId: "DEV1",
       clientId: "phone-1",
       userId: "@u_x:hs",
+      reusable: true, // PL4: reusable rides every redeem of a reusable code
+      redeemIndex: 1,
     });
     expect(onDeviceRedeemed).toHaveBeenNthCalledWith(2, {
       deviceId: "DEV2",
       clientId: undefined,
       userId: "@u_x:hs",
+      reusable: true,
+      redeemIndex: 2,
     });
     expect(sendPairStatus).not.toHaveBeenCalled();
     mgr.dispose();

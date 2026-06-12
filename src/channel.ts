@@ -352,10 +352,16 @@ export const chat4000Plugin = {
                 const control = handle.controlRoomId;
                 if (control) await sendPairStatus(handle.client, control, { pairId, state, error });
               },
-              onDeviceRedeemed: ({ userId, clientId }) => {
-                // PL4: machine↔phone join, once per redeemed device.
+              onDeviceRedeemed: ({ userId, clientId, reusable, redeemIndex }) => {
+                // PL4: machine↔phone join, once per redeemed device — canonical
+                // props {paired_client_id?, reusable, redeem_index?} (optional
+                // ones omitted when unknown, never fabricated).
                 if (clientId) registerPairedClientId(clientId);
-                track("pairing_completed", clientId ? { paired_client_id: clientId } : {});
+                track("pairing_completed", {
+                  reusable,
+                  ...(redeemIndex !== undefined ? { redeem_index: redeemIndex } : {}),
+                  ...(clientId ? { paired_client_id: clientId } : {}),
+                });
                 // PROTOCOL C.3: membership needs nothing (invites pre-exist
                 // from setup) and KEYING rides the normal next-send key share
                 // (C.6 single-crypto-owner) — but a brand-new user still gets

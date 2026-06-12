@@ -16,6 +16,7 @@ import {
 import {
   isTransientRegistrarError,
   PAIR_CODE_TTL_MAX_SECONDS,
+  redeemIndexOf,
   RegistrarClient,
   RegistrarError,
   type EnsureUserResult,
@@ -653,9 +654,14 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
       // (latest pairing wins). Absent on old registrars / telemetry-off phones.
       const pairedClientId = redeem.clientId?.trim();
       if (pairedClientId) registerPairedClientId(pairedClientId);
-      // PL4: the canonical prop is paired_client_id only (absent on old
-      // registrars / telemetry-off phones; the event still counts the join).
-      track("pairing_completed", pairedClientId ? { paired_client_id: pairedClientId } : {});
+      // PL4 canonical props: {paired_client_id?, reusable, redeem_index?} —
+      // optional ones omitted when unknown, never fabricated.
+      const redeemIndex = redeemIndexOf(status, redeem.deviceId);
+      track("pairing_completed", {
+        reusable,
+        ...(redeemIndex !== undefined ? { redeem_index: redeemIndex } : {}),
+        ...(pairedClientId ? { paired_client_id: pairedClientId } : {}),
+      });
     }
     if (fresh.length > 0) await flushAnalytics();
     if (redeems.length > 0) {
