@@ -76,7 +76,6 @@ export function resolveChat4000Account(params: {
   let userId = "";
   let accessToken = "";
   let deviceId = "";
-  let pluginId: string | undefined;
   let credentialSource: ResolvedChat4000Account["credentialSource"] = "missing";
 
   if (envGatewayUrl && envUserId && envAccessToken) {
@@ -96,7 +95,6 @@ export function resolveChat4000Account(params: {
     userId = stored.userId;
     accessToken = stored.accessToken;
     deviceId = stored.deviceId;
-    pluginId = stored.pluginId;
     credentialSource = "state-file";
   }
 
@@ -112,7 +110,6 @@ export function resolveChat4000Account(params: {
     userId,
     accessToken,
     deviceId,
-    pluginId,
     credentialSource,
     provisioning: resolveProvisioning(merged),
     config: merged,

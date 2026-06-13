@@ -243,10 +243,8 @@ export const chat4000Plugin = {
       if (ctx.account.provisioning.url) {
         try {
           const verdict = await checkPluginVersion({
-            registrar: new RegistrarClient({
-              baseUrl: ctx.account.provisioning.url,
-              serviceToken: ctx.account.provisioning.serviceToken ?? "",
-            }),
+            // PROTOCOL C.5.1: `POST /version` is public — no token.
+            registrar: new RegistrarClient({ baseUrl: ctx.account.provisioning.url }),
             releaseChannel: ctx.account.config.releaseChannel,
           });
           const notice = formatVersionNotice(verdict);
@@ -268,7 +266,6 @@ export const chat4000Plugin = {
           userId: ctx.account.userId,
           accessToken: ctx.account.accessToken,
           deviceId: ctx.account.deviceId,
-          pluginId: ctx.account.pluginId,
         },
         releaseChannel: ctx.account.config.releaseChannel,
         initialSyncLimit: ctx.account.config.initialSyncLimit,
@@ -333,21 +330,22 @@ export const chat4000Plugin = {
 
           // PROTOCOL C.4 "Completion listening" + E device pairing: the
           // gateway-resident listener owns pairing completion — it polls
-          // /pair/status for every outstanding code (CLI-registered ones
-          // included, surviving restarts via the persistent store) and handles
-          // interactive device.pair_* commands. Needs a registrar (provisioning
-          // config) + the plugin id; without them the device.pair_* commands
-          // answer "unavailable".
+          // `GET /codes/{code}` (C.3.3) for every outstanding code (CLI-minted
+          // ones included, surviving restarts via the persistent store) and
+          // handles interactive device.pair_* commands. `POST /codes` and
+          // `GET /codes/{code}` authenticate with the plugin's BOT access token
+          // (C.4 "Proof of bot"), so the registrar client carries it; without a
+          // registrar URL + bot token the device.pair_* commands answer
+          // "unavailable".
           const provisioning = ctx.account.provisioning;
-          if (provisioning.url && provisioning.serviceToken && ctx.account.pluginId) {
+          if (provisioning.url && ctx.account.accessToken) {
             const registrar = new RegistrarClient({
               baseUrl: provisioning.url,
-              serviceToken: provisioning.serviceToken,
+              botAccessToken: ctx.account.accessToken,
             });
             const manager = new DevicePairingManager({
               accountId: ctx.account.accountId,
               registrar,
-              pluginId: ctx.account.pluginId,
               sendPairStatus: async (pairId, state, error) => {
                 const control = handle.controlRoomId;
                 if (control) await sendPairStatus(handle.client, control, { pairId, state, error });

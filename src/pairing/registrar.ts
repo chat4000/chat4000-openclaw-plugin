@@ -1,41 +1,60 @@
 /**
- * HTTP client for the chat4000 Registrar (PROTOCOL C).
+ * HTTP client for the chat4000 Registrar (PROTOCOL C, v2 endpoints).
  *
- *   POST /user/ensure    (bearer SERVICE_TOKEN)  { plugin_id }
- *                                                -> { user_id, created }          (C.6.1)
- *   POST /pair/register  (bearer SERVICE_TOKEN)  { code, plugin_id, user_id?,
- *                                                  ttl_seconds?, reusable? }
- *                                                -> { ok, expires_at }            (C.1)
- *   POST /pair/redeem    (public; code is secret) { code, device_name? }
- *                                                -> { gateway_url, user_id, device_id, access_token }
- *   GET  /pair/status?code=...  (bearer)         -> { status, user_id?, client_id?,
- *                                                     redeems[], redeemed_count,
- *                                                     expires_at? }               (C.3)
+ *   POST /plugins            (bearer SERVICE_TOKEN)   {} -> { bot_user_id,
+ *                                                       bot_access_token,
+ *                                                       device_id, gateway_url } (C.1)
+ *   PUT  /user               (bearer BOT_TOKEN)       {} -> { user_id, created }  (C.2)
+ *   POST /codes              (bearer BOT_TOKEN)        { code, ttl_seconds?,
+ *                                                       reusable? } -> { ok,
+ *                                                       expires_at }              (C.3.1)
+ *   POST /codes/{code}/redeem (public; code is secret) { device_name? }
+ *                              -> { gateway_url, user_id, device_id, access_token } (C.3.2)
+ *   GET  /codes/{code}       (bearer BOT_TOKEN)       -> { status, user_id?,
+ *                                                       client_id?, redeems[],
+ *                                                       redeemed_count, expires_at? } (C.3.3)
+ *   POST /version            (public)                 -> version policy verdict   (C.5.1)
  *
- * The plugin picks the pairing `code`. Errors are JSON `{errcode, error}` with the
- * documented HTTP status.
+ * Identity (PROTOCOL B): there is NO `plugin_id`. The bot MXID returned by
+ * `POST /plugins` IS the plugin identity; the plugin's one user is DERIVED by
+ * the registrar from the bot MXID at `PUT /user`. The auth split (C.4):
+ *   - SERVICE_TOKEN gates ONLY `POST /plugins` (birthing a bot).
+ *   - the BOT access token gates `PUT /user`, `POST /codes`, `GET /codes/{code}`
+ *     (whoami-verified to be `@plugin_.*` on every call).
+ *   - `POST /codes/{code}/redeem` and `POST /version` are public.
+ *
+ * The plugin picks the pairing `code`. Errors are JSON `{errcode, error}` with
+ * the documented HTTP status.
  */
 import { randomInt } from "node:crypto";
+
+/** PROTOCOL C.1 `POST /plugins` result — births a plugin bot identity. */
+export type CreatePluginResult = {
+  /** The new bot's MXID — `@plugin_<rand>:<server_name>`. This IS the identity. */
+  botUserId: string;
+  /** The bot's durable Matrix access token (proves `PUT /user`, `POST /codes`). */
+  botAccessToken: string;
+  /** The bot's one durable device id. */
+  deviceId: string;
+  /** The WS gateway URL the bot connects to. */
+  gatewayUrl: string;
+};
 
 export type PairRegisterResult = {
   ok: boolean;
   expiresAt: number;
 };
 
-export type PairKind = "user" | "plugin";
-
 export type PairRedeemResult = {
   gatewayUrl: string;
   userId: string;
   deviceId: string;
   accessToken: string;
-  /** Only present for a `kind=plugin` code — the id the registrar issued. */
-  pluginId?: string | undefined;
 };
 
 type PairStatus = "pending" | "completed" | "expired";
 
-/** One completed redeem of a code (PROTOCOL C.3 `redeems[]` entries). */
+/** One completed redeem of a code (PROTOCOL C.3.3 `redeems[]` entries). */
 export type PairRedeem = {
   deviceId: string;
   /** Per-redeem analytics id; absent when that device's telemetry was off. */
@@ -46,15 +65,15 @@ export type PairRedeem = {
 
 export type PairStatusResult = {
   /**
-   * PROTOCOL C.3: a single-use code settles `completed`; a reusable code stays
-   * `pending` while live, however many redeems it has. A watcher waiting for
-   * "someone paired" checks `redeems` non-empty, not `status`.
+   * PROTOCOL C.3.3: a single-use code settles `completed`; a reusable code
+   * stays `pending` while live, however many redeems it has. A watcher waiting
+   * for "someone paired" checks `redeems` non-empty, not `status`.
    */
   status: PairStatus;
   userId?: string | undefined;
   /**
    * FLW2: the MOST RECENT redeem's analytics `client_id`, present when that
-   * phone sent one (absent on old registrars / telemetry-off phones).
+   * phone sent one (absent on telemetry-off phones).
    */
   clientId?: string | undefined;
   /**
@@ -64,17 +83,18 @@ export type PairStatusResult = {
   redeems: PairRedeem[];
   /** Total redeems of this code (may exceed `redeems.length` once truncated). */
   redeemedCount: number;
-  /** Unix ms the code expires; present while `pending` (C.3). */
+  /** Unix ms the code expires; present while `pending` (C.3.3). */
   expiresAt?: number | undefined;
 };
 
 /**
- * PL4 `redeem_index` derivation (registry-documented): `/pair/status` carries
- * no per-entry index, so derive it from the wire fields —
+ * PL4 `redeem_index` derivation (registry-documented): `GET /codes/{code}`
+ * carries no per-entry index, so derive it from the wire fields —
  * `redeemedCount − redeems.length + position + 1`, with `redeemedCount`
- * falling back to `redeems.length` when absent/0. The old-registrar completed
- * shape (no `redeems[]`) counts as the single first redeem → 1. Undefined when
- * the entry can't be located (never fabricate).
+ * falling back to `redeems.length` when absent/0. A `completed` status with an
+ * empty `redeems[]` counts as the single first redeem → 1 (the callers'
+ * synthesized-redeem fallback). Undefined when the entry can't be located
+ * (never fabricate).
  */
 export function redeemIndexOf(status: PairStatusResult, deviceId: string): number | undefined {
   if (status.redeems.length === 0) return status.status === "completed" ? 1 : undefined;
@@ -84,9 +104,9 @@ export function redeemIndexOf(status: PairStatusResult, deviceId: string): numbe
   return count - status.redeems.length + pos + 1;
 }
 
-/** PROTOCOL C.6.1 `POST /user/ensure` result. */
+/** PROTOCOL C.2 `PUT /user` result. */
 export type EnsureUserResult = {
-  /** The plugin's one user MXID (registrar-generated). */
+  /** The plugin's one user MXID (registrar-derived from the bot MXID). */
   userId: string;
   /** True when this call created the account; false on an idempotent repeat. */
   created: boolean;
@@ -138,11 +158,11 @@ export class RegistrarError extends Error {
 }
 
 /**
- * True for errors the /pair/status polling path retries with backoff instead of
- * killing pairing (observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED from
- * /pair/status killed the Hermes twin's pairing). Transient = HTTP 429 and
- * 502/503/504, plus anything that is NOT a structured {@link RegistrarError} —
- * those come from `fetch` itself (DNS failure, refused/reset connection, the
+ * True for errors the `GET /codes/{code}` polling path retries with backoff
+ * instead of killing pairing (observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED
+ * from status polling killed the Hermes twin's pairing). Transient = HTTP 429
+ * and 502/503/504, plus anything that is NOT a structured {@link RegistrarError}
+ * — those come from `fetch` itself (DNS failure, refused/reset connection, the
  * request-timeout abort), i.e. connection-level failures. Other 4xx keep
  * failing fast.
  */
@@ -153,16 +173,30 @@ export function isTransientRegistrarError(error: unknown): boolean {
 export type RegistrarClientOptions = {
   /** Registrar base URL, e.g. https://registrar.chat4000.com. */
   baseUrl: string;
-  /** SERVICE_TOKEN bearer for /pair/register and /pair/status. */
-  serviceToken: string;
+  /**
+   * SERVICE_TOKEN bearer — gates ONLY `POST /plugins` (C.1, C.4). Optional: a
+   * client that only mints codes / polls status needs only the bot token.
+   */
+  serviceToken?: string | undefined;
+  /**
+   * The plugin bot's own access token (from `POST /plugins`, = the plugin's
+   * Matrix access token). Gates `PUT /user`, `POST /codes`, `GET /codes/{code}`
+   * (C.2/C.3.1/C.3.3, C.4 "Proof of bot"). Optional: only `POST /plugins` and
+   * the public endpoints work without it.
+   */
+  botAccessToken?: string | undefined;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
 };
 
+type AuthKind = "service" | "bot" | "none";
+
 export class RegistrarClient {
   private readonly baseUrl: string;
 
-  private readonly serviceToken: string;
+  private readonly serviceToken: string | undefined;
+
+  private readonly botAccessToken: string | undefined;
 
   private readonly timeoutMs: number;
 
@@ -171,72 +205,91 @@ export class RegistrarClient {
   constructor(opts: RegistrarClientOptions) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.serviceToken = opts.serviceToken;
+    this.botAccessToken = opts.botAccessToken;
     this.timeoutMs = opts.timeoutMs ?? 10_000;
     this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
   /**
-   * Create (or return) the plugin's one user (PROTOCOL C.6.1). Idempotent per
-   * `pluginId` — a repeat returns the SAME user with `created: false`. Every
-   * later `kind=user` registration binds codes to this user (C.1).
+   * PROTOCOL C.1 `POST /plugins` — birth a plugin bot. Auth: the SERVICE_TOKEN.
+   * Mints a fresh `@plugin_<rand>` account + its one durable device and returns
+   * the bot MXID (the identity — there is no `plugin_id`), its durable access
+   * token, device id, and gateway URL. NOT idempotent: every call mints a new
+   * bot, so the plugin calls this exactly once at first self-onboard (C.6 step 1).
    */
-  async ensureUser(params: { pluginId: string }): Promise<EnsureUserResult> {
-    const body = (await this.request("POST", "/user/ensure", {
-      auth: true,
-      body: { plugin_id: params.pluginId },
+  async createPlugin(): Promise<CreatePluginResult> {
+    const body = (await this.request("POST", "/plugins", {
+      auth: "service",
+      body: {},
+    })) as Record<string, unknown>;
+    return {
+      botUserId: String(body.bot_user_id),
+      botAccessToken: String(body.bot_access_token),
+      deviceId: String(body.device_id),
+      gatewayUrl: String(body.gateway_url),
+    };
+  }
+
+  /**
+   * PROTOCOL C.2 `PUT /user` — create-or-return the plugin's one user. Auth:
+   * the BOT access token (NOT the service token). The registrar DERIVES the
+   * user localpart from the verified bot MXID, so this is idempotent and
+   * wipe-proof: a repeat returns the SAME user with `created: false`. Body is
+   * empty — the bot token alone selects the user (no `plugin_id`).
+   */
+  async ensureUser(): Promise<EnsureUserResult> {
+    const body = (await this.request("PUT", "/user", {
+      auth: "bot",
+      body: {},
     })) as Record<string, unknown>;
     return { userId: String(body.user_id), created: Boolean(body.created) };
   }
 
   /**
-   * Reserve a pairing code (PROTOCOL C.1). `kind="user"` (default) requires a
-   * `pluginId`; the registrar binds the code AT REGISTRATION to the user
-   * `/user/ensure` created for that plugin (400 if setup never ran).
-   * `kind="plugin"` omits it (the registrar issues a new plugin_id at redeem).
-   * `reusable` codes (kind=user only) redeem repeatedly until expiry, each
-   * redeem adding another device; `ttlSeconds` may go up to 2 years.
+   * PROTOCOL C.3.1 `POST /codes` — mint a pairing code. Auth: the BOT access
+   * token. The code is bound to the bot's DERIVED user implicitly (no
+   * `user_id`, no `kind`, no `plugin_id`); the registrar verifies that user
+   * exists (else `409 M_NO_USER` — run `PUT /user`/setup first). `reusable`
+   * codes redeem repeatedly until expiry, each redeem adding another device;
+   * `ttlSeconds` may go up to 2 years (C.3.1).
    */
-  async registerPairing(params: {
+  async mintCode(params: {
     code: string;
-    kind?: PairKind | undefined;
-    pluginId?: string | undefined;
-    userId?: string | undefined;
     ttlSeconds?: number | undefined;
     reusable?: boolean | undefined;
   }): Promise<PairRegisterResult> {
-    const body = (await this.request("POST", "/pair/register", {
-      auth: true,
+    const body = (await this.request("POST", "/codes", {
+      auth: "bot",
       body: {
         code: params.code,
-        kind: params.kind,
-        plugin_id: params.pluginId,
-        user_id: params.userId,
-        ttl_seconds: params.ttlSeconds,
+        ...(params.ttlSeconds !== undefined ? { ttl_seconds: params.ttlSeconds } : {}),
         ...(params.reusable !== undefined ? { reusable: params.reusable } : {}),
       },
     })) as Record<string, unknown>;
     return { ok: Boolean(body.ok), expiresAt: Number(body.expires_at) };
   }
 
-  /** Redeem a pairing code (public). Used for plugin self-bootstrap too. */
+  /**
+   * PROTOCOL C.3.2 `POST /codes/{code}/redeem` — redeem a code (public; the
+   * code in the path is the secret). Mints a device on the code's bound user.
+   */
   async redeemPairing(params: { code: string; deviceName?: string }): Promise<PairRedeemResult> {
-    const body = (await this.request("POST", "/pair/redeem", {
-      auth: false,
-      body: { code: params.code, device_name: params.deviceName },
+    const body = (await this.request("POST", `/codes/${encodeURIComponent(params.code)}/redeem`, {
+      auth: "none",
+      body: params.deviceName !== undefined ? { device_name: params.deviceName } : {},
     })) as Record<string, unknown>;
     return {
       gatewayUrl: String(body.gateway_url),
       userId: String(body.user_id),
       deviceId: String(body.device_id),
       accessToken: String(body.access_token),
-      pluginId: typeof body.plugin_id === "string" ? body.plugin_id : undefined,
     };
   }
 
   /**
    * Check the version policy for this caller (PROTOCOL C.5.1). PUBLIC endpoint —
    * version policy is not secret and one endpoint serves apps + plugins, so it
-   * carries no service token. The registrar semver-compares and returns the verdict.
+   * carries no token. The registrar semver-compares and returns the verdict.
    */
   async checkVersion(params: {
     appId: string;
@@ -251,7 +304,7 @@ export class RegistrarClient {
     clientId?: string | null | undefined;
   }): Promise<VersionPolicyResult> {
     const body = (await this.request("POST", "/version", {
-      auth: false,
+      auth: "none",
       clientId: params.clientId,
       body: {
         app_id: params.appId,
@@ -273,10 +326,10 @@ export class RegistrarClient {
     };
   }
 
-  /** Poll pairing completion (plugin → registrar, PROTOCOL C.3). */
+  /** Poll pairing completion (plugin → registrar, PROTOCOL C.3.3). Bot-token auth. */
   async getPairingStatus(code: string): Promise<PairStatusResult> {
-    const body = (await this.request("GET", `/pair/status?code=${encodeURIComponent(code)}`, {
-      auth: true,
+    const body = (await this.request("GET", `/codes/${encodeURIComponent(code)}`, {
+      auth: "bot",
     })) as Record<string, unknown>;
     return {
       status: String(body.status) as PairStatus,
@@ -291,13 +344,27 @@ export class RegistrarClient {
   private async request(
     method: string,
     pathName: string,
-    opts: { auth: boolean; body?: unknown; clientId?: string | null | undefined },
+    opts: { auth: AuthKind; body?: unknown; clientId?: string | null | undefined },
   ): Promise<unknown> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     const headers: Record<string, string> = { Accept: "application/json" };
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
-    if (opts.auth) headers.Authorization = `Bearer ${this.serviceToken}`;
+    if (opts.auth === "service") {
+      if (!this.serviceToken) {
+        clearTimeout(timer);
+        throw new Error(`registrar ${method} ${pathName} needs a SERVICE_TOKEN but none was set`);
+      }
+      headers.Authorization = `Bearer ${this.serviceToken}`;
+    } else if (opts.auth === "bot") {
+      if (!this.botAccessToken) {
+        clearTimeout(timer);
+        throw new Error(
+          `registrar ${method} ${pathName} needs the bot access token but none was set`,
+        );
+      }
+      headers.Authorization = `Bearer ${this.botAccessToken}`;
+    }
     // PL3: the machine analytics id. Caller passes null when telemetry is off.
     if (opts.clientId) headers["X-Client-Id"] = opts.clientId.slice(0, 64);
 
@@ -326,7 +393,7 @@ export class RegistrarClient {
   }
 }
 
-/** Decode the untrusted `redeems` array off a /pair/status body (C.3). */
+/** Decode the untrusted `redeems` array off a `GET /codes/{code}` body (C.3.3). */
 function parseRedeems(raw: unknown): PairRedeem[] {
   if (!Array.isArray(raw)) return [];
   const redeems: PairRedeem[] = [];
@@ -351,13 +418,14 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
-/** PROTOCOL C.1: `ttl_seconds` upper bound — 63 072 000 s = 2 years. */
+/** PROTOCOL C.3.1: `ttl_seconds` upper bound — 63 072 000 s = 2 years. */
 export const PAIR_CODE_TTL_MAX_SECONDS = 63_072_000;
 
 /**
- * Generate a pairing code: **exactly 6 uniformly-random digits** (PROTOCOL C.1/C.2).
- * The registrar rejects anything that isn't 6 digits. `randomInt` is CSPRNG-backed
- * and unbiased (rejection-sampled internally), so there is no modulo skew.
+ * Generate a pairing code: **exactly 6 uniformly-random digits** (PROTOCOL
+ * C.3/C.4). The registrar rejects anything that isn't 6 digits. `randomInt` is
+ * CSPRNG-backed and unbiased (rejection-sampled internally), so there is no
+ * modulo skew.
  */
 export function generatePairingCode(): string {
   let code = "";

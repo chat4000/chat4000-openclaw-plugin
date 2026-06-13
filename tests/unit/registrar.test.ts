@@ -34,42 +34,138 @@ function mockFetch(
 }
 
 describe("RegistrarClient", () => {
-  it("registerPairing posts code+plugin_id with bearer auth (PROTOCOL §3.1)", async () => {
+  it("createPlugin POSTs /plugins with the SERVICE token and maps the bot identity (PROTOCOL C.1)", async () => {
     let captured: { url: string; init: RequestInit } | undefined;
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com/",
       serviceToken: "svc-token",
       fetchImpl: mockFetch((url, init) => {
         captured = { url, init };
+        return {
+          status: 200,
+          body: {
+            bot_user_id: "@plugin_x:chat4000.com",
+            bot_access_token: "bot-token",
+            device_id: "BOTDEV",
+            gateway_url: "wss://gateway.chat4000.com/ws",
+          },
+        };
+      }),
+    });
+
+    const res = await client.createPlugin();
+    expect(res).toEqual({
+      botUserId: "@plugin_x:chat4000.com",
+      botAccessToken: "bot-token",
+      deviceId: "BOTDEV",
+      gatewayUrl: "wss://gateway.chat4000.com/ws",
+    });
+    expect(captured?.url).toBe("https://registrar.chat4000.com/plugins");
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer svc-token",
+    );
+    // Empty body (PROTOCOL C.1).
+    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({});
+  });
+
+  it("createPlugin without a service token throws before any fetch (C.4)", async () => {
+    const fetchImpl = vi.fn();
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      botAccessToken: "bot-token",
+      fetchImpl,
+    });
+    await expect(client.createPlugin()).rejects.toThrow(/SERVICE_TOKEN/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("ensureUser PUTs /user with the BOT token and an empty body, maps the result (PROTOCOL C.2)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      botAccessToken: "bot-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
+        return { status: 200, body: { user_id: "@u_x:chat4000.com", created: true } };
+      }),
+    });
+
+    const res = await client.ensureUser();
+    expect(res).toEqual({ userId: "@u_x:chat4000.com", created: true });
+    expect(captured?.init.method).toBe("PUT");
+    expect(captured?.url).toBe("https://registrar.chat4000.com/user");
+    // Bot token, NOT the service token (C.2/C.4).
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer bot-token",
+    );
+    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({});
+  });
+
+  it("ensureUser without a bot token throws before any fetch (C.4)", async () => {
+    const fetchImpl = vi.fn();
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl,
+    });
+    await expect(client.ensureUser()).rejects.toThrow(/bot access token/);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("mintCode POSTs /codes with the BOT token; no kind/user_id/plugin_id (PROTOCOL C.3.1)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      botAccessToken: "bot-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
         return { status: 200, body: { ok: true, expires_at: 1700000000000 } };
       }),
     });
 
-    const res = await client.registerPairing({
-      code: "ABC-123",
-      pluginId: "plugin-uuid",
-      ttlSeconds: 300,
-    });
-
+    const res = await client.mintCode({ code: "428913", ttlSeconds: 300 });
     expect(res).toEqual({ ok: true, expiresAt: 1700000000000 });
-    expect(captured?.url).toBe("https://registrar.chat4000.com/pair/register");
+    expect(captured?.url).toBe("https://registrar.chat4000.com/codes");
     expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
-      "Bearer svc-token",
+      "Bearer bot-token",
     );
-    expect(JSON.parse(bodyText(captured?.init.body))).toMatchObject({
-      code: "ABC-123",
-      plugin_id: "plugin-uuid",
-      ttl_seconds: 300,
-    });
+    const body = JSON.parse(bodyText(captured?.init.body)) as Record<string, unknown>;
+    expect(body).toEqual({ code: "428913", ttl_seconds: 300 });
+    expect(body).not.toHaveProperty("kind");
+    expect(body).not.toHaveProperty("user_id");
+    expect(body).not.toHaveProperty("plugin_id");
   });
 
-  it("redeemPairing is public (no auth) and maps the response (PROTOCOL §3.2)", async () => {
-    let authHeader: string | undefined = "set";
+  it("mintCode passes reusable + a 2-year ttl through; omits reusable when absent (C.3.1)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
-      fetchImpl: mockFetch((_url, init) => {
-        authHeader = (init.headers as Record<string, string>).Authorization;
+      botAccessToken: "bot-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
+        return { status: 200, body: { ok: true, expires_at: 1750000000000 } };
+      }),
+    });
+
+    await client.mintCode({ code: "428913", ttlSeconds: 63_072_000, reusable: true });
+    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({
+      code: "428913",
+      ttl_seconds: 63_072_000,
+      reusable: true,
+    });
+
+    // Single-use semantics unchanged when the flag is absent (C.3.1).
+    await client.mintCode({ code: "428913" });
+    expect(JSON.parse(bodyText(captured?.init.body))).not.toHaveProperty("reusable");
+  });
+
+  it("redeemPairing is public, posts code in the PATH (no auth) and maps the response (C.3.2)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      botAccessToken: "bot-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
         return {
           status: 200,
           body: {
@@ -82,7 +178,7 @@ describe("RegistrarClient", () => {
       }),
     });
 
-    const res = await client.redeemPairing({ code: "ABC-123" });
+    const res = await client.redeemPairing({ code: "428913", deviceName: "phone" });
 
     expect(res).toEqual({
       gatewayUrl: "wss://gateway.chat4000.com/ws",
@@ -90,20 +186,28 @@ describe("RegistrarClient", () => {
       deviceId: "DEV1",
       accessToken: "tok",
     });
-    expect(authHeader).toBeUndefined();
+    // Code in the path; no Authorization header on the public redeem (C.3.2/C.4).
+    expect(captured?.url).toBe("https://registrar.chat4000.com/codes/428913/redeem");
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBeUndefined();
+    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({ device_name: "phone" });
   });
 
-  it("getPairingStatus reports completion + user (PROTOCOL C.3)", async () => {
+  it("getPairingStatus GETs /codes/{code} with the BOT token + reports completion (C.3.3)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
-      fetchImpl: mockFetch((url) => {
-        expect(url).toContain("/pair/status?code=ABC-123");
+      botAccessToken: "bot-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
         return { status: 200, body: { status: "completed", user_id: "@u_x:chat4000.com" } };
       }),
     });
 
-    const res = await client.getPairingStatus("ABC-123");
+    const res = await client.getPairingStatus("428913");
+    expect(captured?.url).toBe("https://registrar.chat4000.com/codes/428913");
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer bot-token",
+    );
     expect(res).toEqual({
       status: "completed",
       userId: "@u_x:chat4000.com",
@@ -117,14 +221,14 @@ describe("RegistrarClient", () => {
   it("getPairingStatus surfaces the redeeming phone's client_id when completed (FLW2)", async () => {
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
+      botAccessToken: "bot-token",
       fetchImpl: mockFetch(() => ({
         status: 200,
         body: { status: "completed", user_id: "@u_x:chat4000.com", client_id: "phone-uuid" },
       })),
     });
 
-    const res = await client.getPairingStatus("ABC-123");
+    const res = await client.getPairingStatus("428913");
     expect(res).toEqual({
       status: "completed",
       userId: "@u_x:chat4000.com",
@@ -135,10 +239,10 @@ describe("RegistrarClient", () => {
     });
   });
 
-  it("getPairingStatus maps redeems[] + redeemed_count + expires_at (PROTOCOL C.3)", async () => {
+  it("getPairingStatus maps redeems[] + redeemed_count + expires_at (PROTOCOL C.3.3)", async () => {
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
+      botAccessToken: "bot-token",
       fetchImpl: mockFetch(() => ({
         status: 200,
         body: {
@@ -172,55 +276,6 @@ describe("RegistrarClient", () => {
     });
   });
 
-  it("registerPairing passes reusable + a 2-year ttl through (PROTOCOL C.1)", async () => {
-    let captured: { url: string; init: RequestInit } | undefined;
-    const client = new RegistrarClient({
-      baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
-      fetchImpl: mockFetch((url, init) => {
-        captured = { url, init };
-        return { status: 200, body: { ok: true, expires_at: 1750000000000 } };
-      }),
-    });
-
-    await client.registerPairing({
-      code: "428913",
-      pluginId: "plugin-uuid",
-      ttlSeconds: 63_072_000,
-      reusable: true,
-    });
-    expect(JSON.parse(bodyText(captured?.init.body))).toMatchObject({
-      code: "428913",
-      plugin_id: "plugin-uuid",
-      ttl_seconds: 63_072_000,
-      reusable: true,
-    });
-
-    // Single-use semantics unchanged when the flag is absent (C.1).
-    await client.registerPairing({ code: "428913", pluginId: "plugin-uuid" });
-    expect(JSON.parse(bodyText(captured?.init.body))).not.toHaveProperty("reusable");
-  });
-
-  it("ensureUser POSTs /user/ensure with bearer auth and maps the result (PROTOCOL C.6.1)", async () => {
-    let captured: { url: string; init: RequestInit } | undefined;
-    const client = new RegistrarClient({
-      baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
-      fetchImpl: mockFetch((url, init) => {
-        captured = { url, init };
-        return { status: 200, body: { user_id: "@u_x:chat4000.com", created: true } };
-      }),
-    });
-
-    const res = await client.ensureUser({ pluginId: "plugin-uuid" });
-    expect(res).toEqual({ userId: "@u_x:chat4000.com", created: true });
-    expect(captured?.url).toBe("https://registrar.chat4000.com/user/ensure");
-    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
-      "Bearer svc-token",
-    );
-    expect(JSON.parse(bodyText(captured?.init.body))).toEqual({ plugin_id: "plugin-uuid" });
-  });
-
   it("checkVersion sends X-Client-Id when a clientId is given, omits it otherwise (PL3)", async () => {
     let captured: RequestInit | undefined;
     const fetchImpl = mockFetch((_url, init) => {
@@ -229,7 +284,6 @@ describe("RegistrarClient", () => {
     });
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
       fetchImpl,
     });
 
@@ -257,22 +311,22 @@ describe("RegistrarClient", () => {
   it("surfaces {errcode,error} as RegistrarError with status flags", async () => {
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
+      botAccessToken: "bot-token",
       fetchImpl: mockFetch(() => ({
         status: 409,
-        body: { errcode: "M_IN_USE", error: "code already in use" },
+        body: { errcode: "M_CODE_IN_USE", error: "code already in use" },
       })),
     });
 
-    const err = await client.registerPairing({ code: "x", pluginId: "p" }).catch((e) => e);
+    const err = await client.mintCode({ code: "428913" }).catch((e) => e);
     expect(err).toBeInstanceOf(RegistrarError);
     expect((err as RegistrarError).status).toBe(409);
     expect((err as RegistrarError).isConflict).toBe(true);
-    expect((err as RegistrarError).errcode).toBe("M_IN_USE");
+    expect((err as RegistrarError).errcode).toBe("M_CODE_IN_USE");
   });
 
   it("classifies 429/502/503/504 as transient and other 4xx as permanent", () => {
-    // Live failure 2026-06-12: /pair/status answered 429 M_LIMIT_EXCEEDED and
+    // Live failure 2026-06-12: status polling answered 429 M_LIMIT_EXCEEDED and
     // pairing died — these must be retried by the status-polling paths.
     for (const status of [429, 502, 503, 504]) {
       const error = new RegistrarError("try later", status, "M_LIMIT_EXCEEDED");
@@ -292,7 +346,7 @@ describe("RegistrarClient", () => {
     expect(isTransientRegistrarError(new DOMException("aborted", "AbortError"))).toBe(true);
   });
 
-  it("generatePairingCode returns exactly 6 digits (PROTOCOL C.1/C.2)", () => {
+  it("generatePairingCode returns exactly 6 digits (PROTOCOL C.3/C.4)", () => {
     for (let i = 0; i < 200; i += 1) {
       const code = generatePairingCode();
       expect(code).toMatch(/^[0-9]{6}$/);
@@ -303,7 +357,6 @@ describe("RegistrarClient", () => {
     let captured: { url: string; init: RequestInit } | undefined;
     const client = new RegistrarClient({
       baseUrl: "https://registrar.chat4000.com",
-      serviceToken: "svc-token",
       fetchImpl: mockFetch((url, init) => {
         captured = { url, init };
         return {

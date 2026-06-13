@@ -1,6 +1,6 @@
 /**
  * Persistent store of outstanding pairing codes (PROTOCOL C.4 "Completion
- * listening"): the gateway-resident plugin polls `/pair/status` for EVERY
+ * listening"): the gateway-resident plugin polls `GET /codes/{code}` for EVERY
  * outstanding code it has registered — including reusable ones — for the code's
  * whole lifetime, SURVIVING its own restarts. That makes outstanding codes part
  * of the plugin's persistent state, kept here.

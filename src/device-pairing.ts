@@ -2,8 +2,9 @@
  * Gateway-resident pairing-completion listener (PROTOCOL C.4 "Completion
  * listening" + E device pairing).
  *
- * The resident plugin OWNS pairing-completion handling: it polls `/pair/status`
- * for every outstanding code it has registered — including reusable ones — for
+ * The resident plugin OWNS pairing-completion handling: it polls
+ * `GET /codes/{code}` (C.3.3) for every outstanding code it has minted —
+ * including reusable ones — for
  * the code's whole lifetime, surviving restarts (outstanding codes live in the
  * persistent {@link loadOutstandingCodes} store; `resume()` reloads them on
  * boot and a rescan picks up codes the CLI registers while the gateway runs).
@@ -45,7 +46,7 @@ const DEVICE_PAIR_TTL_SECONDS = 120;
 const PAIR_STATUS_POLL_INTERVAL_MS = 1_500;
 /** Slow cadence for long-lived codes (C.4: back off to >= 30 s). */
 const PAIR_STATUS_LONG_POLL_INTERVAL_MS = 30_000;
-/** Exponential-backoff cap for transient /pair/status failures. */
+/** Exponential-backoff cap for transient `GET /codes/{code}` failures. */
 const PAIR_STATUS_MAX_BACKOFF_MS = 30_000;
 /** A code whose whole TTL is within this window is "actively expected" (C.4). */
 const ACTIVE_WINDOW_MS = 600_000;
@@ -70,8 +71,12 @@ export type DeviceRedeem = {
 export type DevicePairingDeps = {
   /** Account whose persistent outstanding-codes store this listener owns. */
   accountId: string;
+  /**
+   * Registrar client carrying the plugin's BOT access token — `POST /codes`
+   * and `GET /codes/{code}` are bot-token-authenticated (PROTOCOL C.3.1/C.3.3,
+   * C.4 "Proof of bot").
+   */
   registrar: RegistrarClient;
-  pluginId: string;
   /** Stream a `chat4000.pair_status` event into the control room (E). */
   sendPairStatus: (pairId: string, state: PairStatusState, error?: string) => Promise<void>;
   /** C.3: a device redeemed a code — fired once per redeem (never re-fired). */
@@ -162,21 +167,22 @@ export class DevicePairingManager {
     }
   }
 
-  /** `device.pair_start`: register a fresh single-use code bound to the requester. */
+  /**
+   * `device.pair_start`: mint a fresh single-use code on the plugin's one
+   * derived user (PROTOCOL C.3.1, E). The code binds to that single user
+   * IMPLICITLY — `POST /codes` takes no `user_id` and the bot has exactly one
+   * user (C.2 derivation), so there is no "someone else's account" to
+   * mis-enroll onto. The authorization that matters is the control-room
+   * boundary (enforced where commands are dispatched), not the sender id.
+   */
   async start(senderId: string): Promise<StartResult> {
     if (!senderId) return { ok: false, error: "event sender missing" };
-    if (!this.deps.pluginId) return { ok: false, error: "plugin_id missing" };
     const pairId = genPairId();
     const code = generatePairingCode();
     let expiresAt = Date.now() + this.ttlSeconds * 1000;
     try {
-      // PROTOCOL E (security-critical): bind to the SENDER's MXID, never a
-      // body value — a member can enroll a device only onto their own account.
-      const registered = await this.deps.registrar.registerPairing({
+      const registered = await this.deps.registrar.mintCode({
         code,
-        kind: "user",
-        pluginId: this.deps.pluginId,
-        userId: senderId,
         ttlSeconds: this.ttlSeconds,
       });
       if (Number.isFinite(registered.expiresAt) && registered.expiresAt > 0) {
@@ -269,7 +275,7 @@ export class DevicePairingManager {
           if (!isTransientRegistrarError(err)) throw err;
           // Transient (429 / 502-504 / network) — report and keep polling with
           // exponential backoff inside the same deadline (observed live
-          // 2026-06-12: a 429 from /pair/status killed the Hermes twin's pairing).
+          // 2026-06-12: a 429 from status polling killed the Hermes twin's pairing).
           this.deps.report(err, "device_pairing.status");
           delayMs = Math.min(delayMs * 2, PAIR_STATUS_MAX_BACKOFF_MS);
         }

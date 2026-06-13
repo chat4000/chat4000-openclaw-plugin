@@ -3,16 +3,16 @@
  *
  * v2 is a different protocol (custom relay → Matrix). Migration snapshots the v1
  * state, then provisions a v2 Matrix bot identity: it prefers credentials that
- * are already configured (env/config/file), else self-onboards via a kind=plugin
- * registrar code (PROTOCOL C). Either way it warns that v1 group-key history
- * cannot cross to Megolm.
+ * are already configured (env/config/file), else self-onboards by minting a
+ * fresh bot via `POST /plugins` (PROTOCOL C.1). Either way it warns that v1
+ * group-key history cannot cross to Megolm.
  *
  * Safety model (ported from /tmp/openclaw/extensions/matrix migration):
  *   detect → (snapshot, abort on failure) → provision → write config → warn.
  * Idempotent: no v1 state ⇒ no-op.
  */
 import type { MatrixCredentials } from "../matrix/types.js";
-import { selfRedeemIdentity } from "../pairing/bot-identity.js";
+import { provisionBot } from "../pairing/bot-identity.js";
 import type { RegistrarClient } from "../pairing/registrar.js";
 import { detectV1State } from "./detect.js";
 import { createV1MigrationSnapshot } from "./snapshot.js";
@@ -72,7 +72,7 @@ export async function runChat4000Migration(params: {
       return { migrated: false, reason: "no-identity", snapshotDir: snapshot.archiveDir };
     }
     write("Self-onboarding a Matrix bot identity via the registrar...");
-    const result = await selfRedeemIdentity({ accountId, registrar, gatewayUrl });
+    const result = await provisionBot({ accountId, registrar, gatewayUrl });
     credentials = result.credentials;
     write(`✓ Matrix identity ready: ${credentials.userId}`);
   } else {

@@ -14,7 +14,7 @@
  *     internals (cli.ts `runSetup` / `runPair`, injected via `WizardDeps`) rather
  *     than shelling out to a sibling CLI binary.
  *   - Identity is minted via `setup --self-redeem --no-pair` (this repo's
- *     equivalent of Hermes' `prepare`), reusing `selfRedeemIdentity`.
+ *     equivalent of Hermes' `prepare`), reusing `provisionBot`.
  *   - Gateway restart-method detection reuses the self-update preflight
  *     (`checkUpdatePreflight().restartMethod`: docker | supervised | foreground).
  *   - Readiness is detected by tailing the plugin's own `runtime.log` for a

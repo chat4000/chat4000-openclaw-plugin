@@ -1,11 +1,12 @@
 /**
- * Human-device pairing (PROTOCOL C.1-C.3).
+ * Human-device pairing (PROTOCOL C.3).
  *
- * The plugin picks a pairing `code`, registers it with the registrar
- * (`/pair/register`, bearer SERVICE_TOKEN), and prints it (text + QR). The
- * chat4000 app redeems the code at the registrar (`/pair/redeem`) and becomes
- * a device on the plugin's one user (C.1 binding). Nothing membership-wise
- * happens at completion — the user's invites pre-exist from setup (C.6).
+ * The plugin picks a pairing `code`, mints it at the registrar (`POST /codes`,
+ * bearer the BOT access token), and prints it (text + QR). The chat4000 app
+ * redeems the code at the registrar (`POST /codes/{code}/redeem`) and becomes a
+ * device on the plugin's one derived user (C.3 binding — implied by the bot
+ * token, never named). Nothing membership-wise happens at completion — the
+ * user's invites pre-exist from setup (C.6).
  *
  * The QR encodes a UNIVERSAL https link (not a custom scheme) so any phone
  * camera app can scan it: it opens pair.chat4000.com, which deep-links into the
@@ -24,20 +25,16 @@ export type StartHumanPairingResult = {
   qrUri: string;
 };
 
-/** Register a fresh pairing code keyed to this plugin. */
+/** Mint a fresh pairing code on the plugin's one derived user (PROTOCOL C.3.1). */
 export async function startHumanPairing(params: {
   registrar: RegistrarClient;
-  pluginId: string;
   ttlSeconds?: number;
-  userId?: string;
-  /** PROTOCOL C.1: redeemable many times until expiry (fleet enrollment). */
+  /** PROTOCOL C.3.1: redeemable many times until expiry (fleet enrollment). */
   reusable?: boolean;
 }): Promise<StartHumanPairingResult> {
   const code = generatePairingCode();
-  const result = await params.registrar.registerPairing({
+  const result = await params.registrar.mintCode({
     code,
-    pluginId: params.pluginId,
-    userId: params.userId,
     ttlSeconds: params.ttlSeconds,
     reusable: params.reusable,
   });

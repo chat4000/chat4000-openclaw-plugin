@@ -13,11 +13,10 @@
 export type MatrixCredentials = {
   /** WS gateway URL from redeem, e.g. wss://gateway.chat4000.com/ws. */
   gatewayUrl: string;
+  /** The plugin's bot MXID — `@plugin_…`. This IS the plugin identity (section B). */
   userId: string;
   accessToken: string;
   deviceId: string;
-  /** Plugin bot id from the provisioning service (stable across logins). */
-  pluginId?: string | undefined;
 };
 
 /** Connection lifecycle surfaced to the channel layer. */

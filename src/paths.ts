@@ -9,7 +9,6 @@
  *     state/<account>/               matrix-js-sdk sync store + Rust crypto store
  *     logs/                          runtime.log, pairing.log, errors.log
  *     session-bindings.json          room <-> OpenClaw session links
- *     instance.json                  per-plugin id + display name
  *
  * Replaces the path helpers that lived in the deleted v1 `key-store.ts`
  * (`resolveOpenClawHome`, `resolveOpenClawHomeDir`, `resolveOpenClawStateDir`).
@@ -64,11 +63,6 @@ export function resolveChat4000CredentialsPath(accountId: string): string {
 /** `~/.openclaw/plugins/chat4000/state/<account>` — matrix-js-sdk + crypto stores. */
 export function resolveChat4000AccountStateDir(accountId: string): string {
   return path.join(resolveChat4000PluginDir(), "state", normalizeAccountId(accountId));
-}
-
-/** `~/.openclaw/plugins/chat4000/instance/<account>.json` — persisted external_refs. */
-export function resolveChat4000InstancePath(accountId: string): string {
-  return path.join(resolveChat4000PluginDir(), "instance", `${normalizeAccountId(accountId)}.json`);
 }
 
 /**

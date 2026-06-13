@@ -1,9 +1,9 @@
 // ─── Plugin config (v2 — Matrix) ────────────────────────────────────────────
 
 export type Chat4000ProvisioningConfig = {
-  /** Registrar base URL, e.g. https://registrar.chat4000.com (PROTOCOL §3). */
+  /** Registrar base URL, e.g. https://registrar.chat4000.com (PROTOCOL C). */
   url?: string | undefined;
-  /** SERVICE_TOKEN bearer the plugin uses for /pair/register and /pair/status. */
+  /** SERVICE_TOKEN bearer — gates ONLY `POST /plugins` (PROTOCOL C.1, C.4). */
   serviceToken?: string | undefined;
 };
 
@@ -43,10 +43,10 @@ export type ResolvedChat4000Account = {
   runtimeLogLevel: "info" | "debug";
   /** WS gateway URL, resolved from credentials file → config → env. */
   gatewayUrl: string;
+  /** The plugin's bot MXID — `@plugin_…`. This IS the plugin identity (section B). */
   userId: string;
   accessToken: string;
   deviceId: string;
-  pluginId?: string | undefined;
   /** Where the credentials came from. */
   credentialSource: "state-file" | "config" | "env" | "missing";
   /** Resolved registrar settings (url + serviceToken), if configured. */

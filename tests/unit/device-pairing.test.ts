@@ -14,7 +14,7 @@ const ACCOUNT = "default";
 
 function makeRegistrar(over: Record<string, unknown> = {}): RegistrarClient {
   return {
-    registerPairing: vi.fn(() => Promise.resolve({ ok: true, expiresAt: 0 })),
+    mintCode: vi.fn(() => Promise.resolve({ ok: true, expiresAt: 0 })),
     getPairingStatus: vi.fn(() =>
       Promise.resolve({ status: "pending", redeems: [], redeemedCount: 0 }),
     ),
@@ -26,7 +26,6 @@ function makeManager(over: Partial<DevicePairingDeps> = {}): DevicePairingManage
   return new DevicePairingManager({
     accountId: ACCOUNT,
     registrar: makeRegistrar(),
-    pluginId: "plug1",
     sendPairStatus: vi.fn(() => Promise.resolve()),
     onDeviceRedeemed: vi.fn(),
     report: vi.fn(),
@@ -50,9 +49,9 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
     rmSync(stateDir, { recursive: true, force: true });
   });
 
-  it("start registers a kind=user code bound to the requester and persists it (C.1 + C.4)", async () => {
-    const registerPairing = vi.fn(() => Promise.resolve({ ok: true, expiresAt: 0 }));
-    const mgr = makeManager({ registrar: makeRegistrar({ registerPairing }) });
+  it("start mints a single-use code on the plugin's one derived user + persists it (C.3.1 + C.4)", async () => {
+    const mintCode = vi.fn(() => Promise.resolve({ ok: true, expiresAt: 0 }));
+    const mgr = makeManager({ registrar: makeRegistrar({ mintCode }) });
     const res = await mgr.start("@alice:hs");
     expect(res.ok).toBe(true);
     if (res.ok) {
@@ -63,15 +62,19 @@ describe("DevicePairingManager (gateway-resident completion listener)", () => {
       expect(stored).toHaveLength(1);
       expect(stored[0]).toMatchObject({ code: res.code, pairId: res.pairId, reusable: false });
     }
-    expect(registerPairing).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "user", pluginId: "plug1", userId: "@alice:hs" }),
-    );
+    // C.3.1: the code binds to the plugin's derived user IMPLICITLY — no
+    // user_id / kind / plugin_id in the mint request (section E, C.2).
+    expect(mintCode).toHaveBeenCalledTimes(1);
+    const mintArg = mintCode.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(mintArg).not.toHaveProperty("kind");
+    expect(mintArg).not.toHaveProperty("userId");
+    expect(mintArg).not.toHaveProperty("pluginId");
     mgr.dispose();
   });
 
-  it("start errors when plugin_id is missing", async () => {
-    const mgr = makeManager({ pluginId: "" });
-    expect(await mgr.start("@a:hs")).toEqual({ ok: false, error: "plugin_id missing" });
+  it("start errors when the event sender is missing", async () => {
+    const mgr = makeManager();
+    expect(await mgr.start("")).toEqual({ ok: false, error: "event sender missing" });
   });
 
   it("on completed: fires onDeviceRedeemed per redeem + a 'completed' pair_status (PL4)", async () => {

@@ -2,7 +2,7 @@
  * Plugin version-policy check (PROTOCOL C.5).
  *
  * The plugin checks the registrar's version policy **on boot** and **before
- * lifecycle/privileged calls** (e.g. `/pair/*`), never on the message path.
+ * lifecycle/privileged calls** (e.g. `PUT /user`, `/codes*`), never on the message path.
  *   - `force_upgrade` → refuse to operate and surface an error (the caller stops
  *     relaying messages and reports to its owner via the control room).
  *   - `recommend_upgrade` → warn (log / notify the owner).

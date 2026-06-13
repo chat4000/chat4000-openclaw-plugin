@@ -1,22 +1,23 @@
 /**
- * Plugin Matrix identity bootstrap (PROTOCOL C).
+ * Plugin Matrix identity bootstrap (PROTOCOL C, section B).
  *
- * Two supported paths:
+ * The plugin's identity IS its bot MXID — there is no separate `plugin_id`
+ * (section B). Two supported paths:
  *
  *   A. Direct (configureIdentity): the operator supplies an existing bot login
- *      — gatewayUrl + userId (`@plugin_…`) + accessToken + deviceId. We persist
- *      it. A plugin_id is taken from the creds or generated/persisted locally.
+ *      — gatewayUrl + userId (`@plugin_…`) + accessToken + deviceId. We persist it.
  *
- *   B. Self-onboard (selfRedeemIdentity): per section C, "a plugin onboarding
- *      itself just registers a kind=plugin code and redeems it." The registrar
- *      mints a `@plugin_…` account, a device, and issues a plugin_id. Redeem
- *      returns {gateway_url, user_id, device_id, access_token, plugin_id}; the
- *      gateway_url is the connection point we persist (there is no homeserver URL).
+ *   B. Self-onboard (provisionBot): PROTOCOL C.6 step 1 / C.1 — call
+ *      `POST /plugins` with the SERVICE_TOKEN. The registrar mints a fresh
+ *      `@plugin_…` account + its one durable device and returns
+ *      `{ bot_user_id, bot_access_token, device_id, gateway_url }`; the bot
+ *      MXID it returns IS the identity, and the bot access token is what the
+ *      plugin runs on and what authenticates `PUT /user` / `POST /codes`
+ *      afterwards (C.2/C.3.1).
  */
 import { saveMatrixCredentials } from "../matrix/credentials.js";
 import type { MatrixCredentials } from "../matrix/types.js";
-import { getOrCreatePluginId } from "./instance.js";
-import { RegistrarClient, generatePairingCode } from "./registrar.js";
+import type { RegistrarClient } from "./registrar.js";
 
 export type ProvisionBotResult = {
   credentials: MatrixCredentials;
@@ -28,36 +29,27 @@ export function configureIdentity(params: {
   accountId: string;
   credentials: MatrixCredentials;
 }): ProvisionBotResult {
-  const pluginId = params.credentials.pluginId ?? getOrCreatePluginId(params.accountId);
-  const credentials: MatrixCredentials = { ...params.credentials, pluginId };
-  const credentialsPath = saveMatrixCredentials(params.accountId, credentials);
-  return { credentials, credentialsPath };
+  const credentialsPath = saveMatrixCredentials(params.accountId, params.credentials);
+  return { credentials: params.credentials, credentialsPath };
 }
 
-/** Path B — self-onboard via a `kind=plugin` registrar code (section C). */
-export async function selfRedeemIdentity(params: {
+/** Path B — self-onboard a bot identity via `POST /plugins` (PROTOCOL C.1, C.6 step 1). */
+export async function provisionBot(params: {
   accountId: string;
   registrar: RegistrarClient;
-  /** Fallback gateway URL (env preset) if redeem somehow omits one. */
+  /** Fallback gateway URL (env preset) if the registrar somehow omits one. */
   gatewayUrl?: string;
 }): Promise<ProvisionBotResult> {
-  const code = generatePairingCode();
-  await params.registrar.registerPairing({ code, kind: "plugin" });
-  const redeemed = await params.registrar.redeemPairing({
-    code,
-    deviceName: "chat4000 OpenClaw plugin",
-  });
-  const gatewayUrl = redeemed.gatewayUrl || params.gatewayUrl;
+  const minted = await params.registrar.createPlugin();
+  const gatewayUrl = minted.gatewayUrl || params.gatewayUrl;
   if (!gatewayUrl) {
-    throw new Error("registrar redeem returned no gateway_url and no fallback was provided");
+    throw new Error("registrar POST /plugins returned no gateway_url and no fallback was provided");
   }
   const credentials: MatrixCredentials = {
     gatewayUrl,
-    userId: redeemed.userId,
-    accessToken: redeemed.accessToken,
-    deviceId: redeemed.deviceId,
-    // Prefer the registrar-issued plugin_id; fall back to a stable local one.
-    pluginId: redeemed.pluginId ?? getOrCreatePluginId(params.accountId),
+    userId: minted.botUserId,
+    accessToken: minted.botAccessToken,
+    deviceId: minted.deviceId,
   };
   const credentialsPath = saveMatrixCredentials(params.accountId, credentials);
   return { credentials, credentialsPath };

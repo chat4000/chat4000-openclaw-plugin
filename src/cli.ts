@@ -4,10 +4,9 @@ import { resolveChat4000Account } from "./accounts.js";
 import { dumpChat4000Trace } from "./error-log.js";
 import { deleteMatrixCredentials } from "./matrix/credentials.js";
 import type { MatrixCredentials } from "./matrix/types.js";
-import { configureIdentity, selfRedeemIdentity } from "./pairing/bot-identity.js";
+import { configureIdentity, provisionBot } from "./pairing/bot-identity.js";
 import { setupPluginRooms } from "./matrix/rooms.js";
 import { endpointsForEnv, resolveEnv, type Chat4000Env } from "./pairing/env.js";
-import { getOrCreatePluginId } from "./pairing/instance.js";
 import {
   addOutstandingCode,
   recordRedeemedDevices,
@@ -161,7 +160,7 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .option("--user-id <id>", "Matrix bot user id, e.g. @plugin_x:chat4000.com")
         .option("--access-token <token>", "Matrix bot access token")
         .option("--device-id <id>", "Matrix bot device id")
-        .option("--self-redeem", "Self-onboard a bot identity via a kind=plugin registrar code")
+        .option("--self-redeem", "Self-onboard a bot identity via the registrar (POST /plugins)")
         .option("--pairing-log-level <level>", "Pairing log level (info|debug)")
         .option("--runtime-log-level <level>", "Runtime log level (info|debug)")
         .option("--no-pair", "Configure identity without starting device pairing")
@@ -223,7 +222,6 @@ export function registerChat4000Cli(api: PluginApiLike): void {
               `gateway: ${account.gatewayUrl || "(missing)"}`,
               `user id: ${account.userId || "(missing)"}`,
               `device id: ${account.deviceId || "(missing)"}`,
-              `plugin id: ${account.pluginId ?? "(unset)"}`,
               `credential source: ${account.credentialSource}`,
               `registrar: ${account.provisioning.url ?? "(unset)"}`,
               `configured: ${account.configured ? "yes" : "no"}`,
@@ -384,13 +382,19 @@ function resolveSelectedEnv(opts: EndpointOpts): Chat4000Env {
   return resolveEnv(opts.stage ? "stage" : opts.env);
 }
 
-function resolveRegistrar(
+/** Resolve the registrar base URL from flags → account config → env preset. */
+function resolveRegistrarUrl(
   account: ReturnType<typeof resolveChat4000Account>,
   opts: EndpointOpts,
-): { client: RegistrarClient; url: string } {
+): string {
   const env = resolveSelectedEnv(opts);
-  const preset = endpointsForEnv(env);
-  const url = opts.registrarUrl?.trim() || account.provisioning.url || preset.registrar;
+  return opts.registrarUrl?.trim() || account.provisioning.url || endpointsForEnv(env).registrar;
+}
+
+function resolveServiceToken(
+  account: ReturnType<typeof resolveChat4000Account>,
+  opts: EndpointOpts,
+): string {
   const serviceToken = opts.serviceToken?.trim() || account.provisioning.serviceToken;
   if (!serviceToken) {
     throw new Error(
@@ -398,7 +402,35 @@ function resolveRegistrar(
         "channels.chat4000.provisioning.serviceToken, or CHAT4000_SERVICE_TOKEN.",
     );
   }
+  return serviceToken;
+}
+
+/**
+ * Registrar client gated by the SERVICE_TOKEN — for `POST /plugins` (C.1), the
+ * only service-token endpoint. Also fine for the public `POST /version` (C.5.1).
+ */
+function resolveServiceRegistrar(
+  account: ReturnType<typeof resolveChat4000Account>,
+  opts: EndpointOpts,
+): { client: RegistrarClient; url: string } {
+  const url = resolveRegistrarUrl(account, opts);
+  const serviceToken = resolveServiceToken(account, opts);
   return { client: new RegistrarClient({ baseUrl: url, serviceToken }), url };
+}
+
+/**
+ * Registrar client gated by the plugin's BOT access token — for `PUT /user`
+ * (C.2), `POST /codes` (C.3.1), and `GET /codes/{code}` (C.3.3), all
+ * bot-token-authenticated (C.4 "Proof of bot"). The bot token is the plugin's
+ * own Matrix access token from `POST /plugins`.
+ */
+function resolveBotRegistrar(
+  account: ReturnType<typeof resolveChat4000Account>,
+  opts: EndpointOpts,
+  botAccessToken: string,
+): { client: RegistrarClient; url: string } {
+  const url = resolveRegistrarUrl(account, opts);
+  return { client: new RegistrarClient({ baseUrl: url, botAccessToken }), url };
 }
 
 function resolveGatewayUrl(
@@ -441,21 +473,24 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   });
   const env = resolveSelectedEnv(opts);
   const gatewayUrl = resolveGatewayUrl(account, opts);
+  const registrarUrl = resolveRegistrarUrl(account, opts);
 
-  // PROTOCOL C.6: setup is bot self-onboard (step 1) → /user/ensure (step 2) →
-  // rooms + invites over a short-lived bot session (step 3). Steps 2+3 run on
-  // BOTH identity paths, so the registrar client is resolved up front; the C.5
-  // version policy is checked once, right before the first privileged call.
-  const { client: registrarClient } = resolveRegistrar(account, opts);
+  // PROTOCOL C.6: setup is bot self-onboard (step 1, `POST /plugins`, service
+  // token) → `PUT /user` (step 2, bot token) → rooms + invites over a
+  // short-lived bot session (step 3). The C.5 version policy is checked once,
+  // right before the first privileged call (public `POST /version`).
   let versionChecked = false;
   const checkVersionOnce = async (): Promise<void> => {
     if (versionChecked) return;
     versionChecked = true;
-    await enforceVersionBeforePrivileged(registrarClient, account.config.releaseChannel);
+    await enforceVersionBeforePrivileged(
+      new RegistrarClient({ baseUrl: registrarUrl }),
+      account.config.releaseChannel,
+    );
   };
 
-  // Bot identity: either operator-supplied direct credentials, or self-onboard
-  // via a kind=plugin registrar code (PROTOCOL C) — C.6 step 1.
+  // Bot identity (C.6 step 1): either operator-supplied direct credentials, or
+  // self-onboard by minting a fresh bot via `POST /plugins` (C.1).
   const directUserId = opts.userId?.trim() || account.userId;
   const directToken = opts.accessToken?.trim() || account.accessToken;
   const directDeviceId = opts.deviceId?.trim() || account.deviceId;
@@ -471,7 +506,6 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
         userId: directUserId,
         accessToken: directToken,
         deviceId: directDeviceId,
-        pluginId: account.pluginId ?? getOrCreatePluginId(account.accountId),
       },
     });
     credentials = result.credentials;
@@ -480,9 +514,10 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   } else if (opts.selfRedeem) {
     await checkVersionOnce();
     output.write(`Self-onboarding a Matrix bot identity via the registrar (${env})...\n`);
-    const result = await selfRedeemIdentity({
+    const { client: serviceRegistrar } = resolveServiceRegistrar(account, opts);
+    const result = await provisionBot({
       accountId: account.accountId,
-      registrar: registrarClient,
+      registrar: serviceRegistrar,
       gatewayUrl,
     });
     credentials = result.credentials;
@@ -497,19 +532,21 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   }
   output.write(`  Credentials: ${credentialsPath}\n`);
 
-  // PROTOCOL C.6 step 2: create (or get) the plugin's ONE user. Idempotent per
-  // plugin_id — re-running setup returns the same user, never a second one.
+  // PROTOCOL C.6 step 2: create (or get) the plugin's ONE user via `PUT /user`,
+  // authenticated by the BOT's own access token (C.2). Identity is DERIVED from
+  // the bot MXID, so this is idempotent + wipe-proof — re-running setup returns
+  // the same user, never a second one.
   await checkVersionOnce();
-  const pluginId = credentials.pluginId ?? getOrCreatePluginId(account.accountId);
+  const { client: botRegistrar } = resolveBotRegistrar(account, opts, credentials.accessToken);
   let ensured: EnsureUserResult;
   try {
-    ensured = await registrarClient.ensureUser({ pluginId });
+    ensured = await botRegistrar.ensureUser();
   } catch (err) {
-    if (err instanceof RegistrarError && err.status === 400) {
+    if (err instanceof RegistrarError && err.status === 401) {
       throw new Error(
-        `registrar rejected plugin_id ${pluginId}: ${err.message}. The registrar only ` +
-          "knows plugin ids it issued at a kind=plugin redeem — re-run " +
-          '"openclaw chat4000 setup --self-redeem" to mint a registrar-issued identity.',
+        `registrar rejected the bot token for PUT /user: ${err.message}. The token must be a ` +
+          "live @plugin_… bot access token (C.2/C.4) — re-run " +
+          '"openclaw chat4000 setup --self-redeem" to mint a fresh bot identity.',
       );
     }
     throw err;
@@ -550,9 +587,9 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   await runPair(api, { account: account.accountId, env: opts.env, stage: opts.stage });
 }
 
-/** Normal /pair/status poll cadence. */
+/** Normal `GET /codes/{code}` poll cadence (C.3.3). */
 const PAIR_STATUS_POLL_INTERVAL_MS = 2_000;
-/** Exponential-backoff cap for transient /pair/status failures. */
+/** Exponential-backoff cap for transient `GET /codes/{code}` failures. */
 const PAIR_STATUS_MAX_BACKOFF_MS = 30_000;
 /**
  * PROTOCOL C.4: the CLI watcher is only the immediate-feedback path while the
@@ -570,10 +607,15 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   if (!account.configured) {
     throw new Error('No Matrix identity yet. Run "openclaw chat4000 setup" first.');
   }
-  const { client } = resolveRegistrar(account, opts);
-  await enforceVersionBeforePrivileged(client, account.config.releaseChannel);
-  const pluginId = account.pluginId ?? getOrCreatePluginId(account.accountId);
-  // PROTOCOL C.1: ttl_seconds may go up to 2 years (63 072 000 s).
+  // PROTOCOL C.3.1/C.3.3: `POST /codes` + `GET /codes/{code}` authenticate with
+  // the plugin's BOT access token (C.4 "Proof of bot"), which is the plugin's
+  // own Matrix access token. Version policy (C.5.1) is public.
+  await enforceVersionBeforePrivileged(
+    new RegistrarClient({ baseUrl: resolveRegistrarUrl(account, opts) }),
+    account.config.releaseChannel,
+  );
+  const { client } = resolveBotRegistrar(account, opts, account.accessToken);
+  // PROTOCOL C.3.1: ttl_seconds may go up to 2 years (63 072 000 s).
   const ttlSeconds = Math.max(
     1,
     Math.min(PAIR_CODE_TTL_MAX_SECONDS, Number.parseInt(opts.ttl ?? "300", 10) || 300),
@@ -584,16 +626,14 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
   try {
     pairing = await startHumanPairing({
       registrar: client,
-      pluginId,
       ttlSeconds,
       reusable,
     });
   } catch (err) {
-    if (err instanceof RegistrarError && err.status === 400) {
-      // C.1: registration requires the plugin's user to exist (bound at
-      // registration) — /user/ensure runs at setup.
+    if (err instanceof RegistrarError && err.status === 409 && err.errcode === "M_NO_USER") {
+      // C.3.1: minting requires the plugin's user to exist (PUT /user at setup).
       throw new Error(
-        `registrar rejected the pairing registration: ${err.message}. ` +
+        `registrar has no user for this plugin yet: ${err.message}. ` +
           'Run "openclaw chat4000 setup" first so the plugin\'s user exists (PROTOCOL C.6).',
       );
     }
@@ -616,9 +656,9 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
     output.write("Code is reusable: each redeem adds another device until it expires.\n");
   }
 
-  // Poll /pair/status for install-time feedback. Transient registrar failures
-  // (429 rate limits, 502/503/504, network errors) must NOT kill pairing —
-  // observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED from /pair/status killed
+  // Poll `GET /codes/{code}` (C.3.3) for install-time feedback. Transient
+  // registrar failures (429 rate limits, 502/503/504, network errors) must NOT
+  // kill pairing — observed live 2026-06-12: a 429 M_LIMIT_EXCEEDED killed
   // the Hermes twin of this flow mid-pairing. They retry with exponential
   // backoff (2s doubling to a 30s cap) inside the same overall deadline; other
   // 4xx (bad token, unknown code, …) are permanent and fail fast.
@@ -751,7 +791,6 @@ async function runMigrate(api: PluginApiLike, opts: MigrateCommandOptions): Prom
         userId: account.userId,
         accessToken: account.accessToken,
         deviceId: account.deviceId,
-        pluginId: account.pluginId,
       }
     : null;
   const serviceToken = opts.serviceToken?.trim() || account.provisioning.serviceToken;

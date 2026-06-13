@@ -44,7 +44,6 @@ function parseMatrixCredentials(raw: string): Result<MatrixCredentials, AppError
     userId: parsed.userId,
     accessToken: parsed.accessToken,
     deviceId: parsed.deviceId,
-    pluginId: typeof parsed.pluginId === "string" ? parsed.pluginId : undefined,
   });
 }
 

@@ -164,10 +164,10 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     const fetchMock = vi.fn((input: string | URL | Request): Promise<Response> => {
       const url = urlOf(input);
       if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
-      if (url.includes("/pair/register")) {
+      if (url.endsWith("/codes")) {
         return jsonResponse(200, { ok: true, expires_at: Date.now() + 300_000 });
       }
-      if (url.includes("/pair/status")) {
+      if (url.includes("/codes/")) {
         statusCallTimes.push(Date.now());
         statusAttempts += 1;
         if (statusAttempts <= 2) {
@@ -207,10 +207,10 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     const fetchMock = vi.fn((input: string | URL | Request): Promise<Response> => {
       const url = urlOf(input);
       if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
-      if (url.includes("/pair/register")) {
+      if (url.endsWith("/codes")) {
         return jsonResponse(200, { ok: true, expires_at: Date.now() + 300_000 });
       }
-      if (url.includes("/pair/status")) {
+      if (url.includes("/codes/")) {
         statusAttempts += 1;
         return jsonResponse(401, { errcode: "M_UNKNOWN_TOKEN", error: "Invalid service token" });
       }
@@ -243,11 +243,11 @@ describe("chat4000 CLI error/exit-code boundary", () => {
       (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
         const url = urlOf(input);
         if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
-        if (url.includes("/pair/register")) {
+        if (url.endsWith("/codes")) {
           registerBody = JSON.parse(bodyText(init?.body)) as Record<string, unknown>;
           return jsonResponse(200, { ok: true, expires_at: Date.now() + 63_072_000_000 });
         }
-        if (url.includes("/pair/status")) {
+        if (url.includes("/codes/")) {
           statusAttempts += 1;
           return jsonResponse(200, {
             status: "pending",
@@ -278,38 +278,37 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     expect(process.exitCode).not.toBe(1);
   });
 
-  // PROTOCOL C.6: setup = self-onboard → /user/ensure → rooms + invites, all
-  // BEFORE any device pairs. Idempotent: a re-run reuses the same user/rooms.
-  it("setup --self-redeem runs /user/ensure then creates rooms for that user (C.6), idempotently", async () => {
-    const calls: string[] = [];
+  // PROTOCOL C.6: setup = birth bot (POST /plugins, service token) → PUT /user
+  // (bot token) → rooms + invites, all BEFORE any device pairs. Idempotent: a
+  // re-run reuses the same derived user/rooms.
+  it("setup --self-redeem births the bot via POST /plugins, then PUT /user creates rooms for that user (C.6), idempotently", async () => {
+    const calls: { name: string; auth?: string }[] = [];
     let ensureCalls = 0;
-    const fetchMock = vi.fn((input: string | URL | Request): Promise<Response> => {
-      const url = urlOf(input);
-      if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
-      if (url.includes("/pair/register")) {
-        calls.push("register");
-        return jsonResponse(200, { ok: true, expires_at: Date.now() + 300_000 });
-      }
-      if (url.includes("/pair/redeem")) {
-        calls.push("redeem");
-        return jsonResponse(200, {
-          gateway_url: "wss://gateway.test.invalid/ws",
-          user_id: "@plugin_x:chat4000.com",
-          device_id: "BOTDEV",
-          access_token: "bot-token",
-          plugin_id: "11111111-1111-1111-1111-111111111111",
-        });
-      }
-      if (url.includes("/user/ensure")) {
-        calls.push("ensure");
-        ensureCalls += 1;
-        return jsonResponse(200, {
-          user_id: "@u_one:chat4000.com",
-          created: ensureCalls === 1, // idempotent repeat returns created:false
-        });
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    });
+    const fetchMock = vi.fn(
+      (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = urlOf(input);
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+        if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
+        if (url.endsWith("/plugins")) {
+          calls.push({ name: "plugins", auth });
+          return jsonResponse(200, {
+            bot_user_id: "@plugin_x:chat4000.com",
+            bot_access_token: "bot-token",
+            device_id: "BOTDEV",
+            gateway_url: "wss://gateway.test.invalid/ws",
+          });
+        }
+        if (url.endsWith("/user")) {
+          calls.push({ name: "user", auth });
+          ensureCalls += 1;
+          return jsonResponse(200, {
+            user_id: "@u_one:chat4000.com",
+            created: ensureCalls === 1, // idempotent repeat returns created:false
+          });
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     const writeConfigFile = vi.fn(() => Promise.resolve());
@@ -321,9 +320,12 @@ describe("chat4000 CLI error/exit-code boundary", () => {
 
     await setup?.({ selfRedeem: true, noPair: true });
     expect(process.exitCode).not.toBe(1);
-    // C.6 order: bot self-onboard (register+redeem) BEFORE /user/ensure.
-    expect(calls).toEqual(["register", "redeem", "ensure"]);
-    // Step 3 creates the rooms for the ensured user (invites pre-exist before pairing).
+    // C.6 order: birth bot (POST /plugins, service token) BEFORE PUT /user (bot token).
+    expect(calls.map((c) => c.name)).toEqual(["plugins", "user"]);
+    // POST /plugins uses the SERVICE_TOKEN; PUT /user uses the new BOT token (C.4).
+    expect(calls[0]?.auth).toMatch(/^Bearer chat4000_svc_/);
+    expect(calls[1]?.auth).toBe("Bearer bot-token");
+    // Step 3 creates the rooms for the derived user (invites pre-exist before pairing).
     expect(setupPluginRoomsMock).toHaveBeenCalledTimes(1);
     expect(setupPluginRoomsMock).toHaveBeenCalledWith(
       expect.objectContaining({ userId: "@u_one:chat4000.com", pluginName: "chat4000" }),
@@ -331,7 +333,8 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     expect(writtenOutput()).toContain("✓ Plugin user created: @u_one:chat4000.com");
     expect(writtenOutput()).toContain("Skipped device pairing.");
 
-    // Re-run: same user comes back (created:false), rooms ensured again, no error.
+    // Re-run: a fresh bot is minted (POST /plugins is not idempotent, C.1) but
+    // PUT /user DERIVES the same user (created:false), rooms ensured again, no error.
     await setup?.({ selfRedeem: true, noPair: true });
     expect(process.exitCode).not.toBe(1);
     expect(ensureCalls).toBe(2);

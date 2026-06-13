@@ -12,7 +12,7 @@ initializeChat4000Telemetry();
 
 // Public surface (v2 — Matrix).
 export { RegistrarClient, RegistrarError, generatePairingCode } from "./src/pairing/registrar.js";
-export { configureIdentity, selfRedeemIdentity } from "./src/pairing/bot-identity.js";
+export { configureIdentity, provisionBot } from "./src/pairing/bot-identity.js";
 export { setupPluginRooms } from "./src/matrix/rooms.js";
 export { checkUpdatePreflight, formatPreflight } from "./src/update/preflight.js";
 export { applyUpdate, rollbackTo } from "./src/update/apply.js";
