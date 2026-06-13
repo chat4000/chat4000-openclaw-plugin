@@ -23,7 +23,10 @@ import {
   type MatrixClient,
   type MatrixEvent,
   MatrixEventEvent,
+  type RoomMember,
   RoomEvent,
+  type RoomState,
+  RoomStateEvent,
   SyncState,
 } from "matrix-js-sdk";
 import {
@@ -281,6 +284,22 @@ export class MatrixClientHandle {
     this.client.on(RoomEvent.Timeline, (event: MatrixEvent) => {
       this.handleTimelineEvent(event);
     });
+
+    // TEMP DIAGNOSTIC (UTD root-cause): prove whether m.room.member state for a
+    // room ever arrives via sync at all. If this NEVER fires for the chatting
+    // user in a session room, the gateway is dropping member events from the
+    // sliding-sync frames (suspect F1); if it fires but the encryptor still sees
+    // [] at send time, membership reaches the SDK but is masked/cleared. Remove
+    // once root-caused.
+    this.client.on(
+      RoomStateEvent.Members,
+      (_event: MatrixEvent, _state: RoomState, member: RoomMember) => {
+        console.warn(
+          `chat4000.diag.member-arrival room=${member.roomId} user=${member.userId} ` +
+            `membership=${String(member.membership)}`,
+        );
+      },
+    );
 
     this.opts.onConnectionState?.("connecting");
     // Sliding sync drives room/event state from the gateway's `sync` frames;

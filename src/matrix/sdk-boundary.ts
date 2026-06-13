@@ -30,6 +30,40 @@ export async function sendTimelineEvent(
   content: MatrixSendContent,
   txnId: string,
 ): Promise<string> {
+  // TEMP DIAGNOSTIC (UTD root-cause): capture, right before the encrypted send,
+  // why the crypto layer may resolve an empty recipient set ("Encrypting for
+  // users: []"). READ-ONLY — we deliberately do NOT call
+  // getEncryptionTargetMembers() here (it has side effects: loadMembersIfNeeded
+  // primes membersPromise + setOutOfBandMembers, which would mask the bug). We
+  // log only the SDK's current member view + an independent /members fetch, then
+  // let the real send run; correlate this line with the crypto's own
+  // "Encrypting for users" line by room id. Disambiguates:
+  //   currentState=[] & serverMembers populated -> sync never delivered members (F1)
+  //   currentState=[] & serverMembers=[]/ERR    -> /members itself empty/broken (F2/Tuwunel)
+  //   currentState populated but crypto logs []  -> SDK not using currentState (F3)
+  // Remove once root-caused.
+  try {
+    const room = client.getRoom(roomId);
+    const cur = room
+      ? room.currentState.getMembers().map((m) => `${m.userId}:${String(m.membership)}`)
+      : ["<no-room>"];
+    let serverMembers = "n/a";
+    try {
+      const chunk = (await client.members(roomId)).chunk ?? [];
+      serverMembers = `${chunk.length}[${chunk
+        .map((e) => `${e.state_key}=${String((e.content as { membership?: unknown }).membership)}`)
+        .join(",")}]`;
+    } catch (err) {
+      serverMembers = `ERR:${String(err)}`;
+    }
+    console.warn(
+      `chat4000.diag.members room=${roomId} type=${String(eventType)} ` +
+        `encrypted=${String(room?.hasEncryptionStateEvent())} membersLoaded=${String(room?.membersLoaded())} ` +
+        `currentState(${cur.length})=[${cur.join(",")}] serverMembers=${serverMembers}`,
+    );
+  } catch {
+    // diagnostic must never break a real send
+  }
   // SDK-union limitation: `sendEvent<K>` types both the event type and `content`
   // (as `TimelineEvents[K]`) off a closed union, which cannot express chat4000's
   // custom event types / msgtypes / `m.new_content` edits.
