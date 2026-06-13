@@ -5,6 +5,7 @@ import path from "node:path";
 import type { MatrixClient } from "matrix-js-sdk";
 import { setupPluginRoomsWithClient } from "../../src/matrix/rooms.js";
 import { readPluginRooms } from "../../src/matrix/space.js";
+import { loadOnboarded } from "../../src/matrix/onboarded-store.js";
 
 const ACCOUNT = "default";
 
@@ -17,11 +18,22 @@ type FakeClient = {
 };
 
 function fakeClient(joinedRooms: string[]): FakeClient {
+  // createRoom returns by call shape: the space (m.space), the control room
+  // (chat4000.room_kind: control), then any further createRoom is a session room
+  // — here, the single starter chat (E "The starter chat room").
   return {
-    createRoom: vi.fn((opts: { creation_content?: { type?: string } }) =>
-      Promise.resolve({
-        room_id: opts.creation_content?.type === "m.space" ? "!space:hs" : "!control:hs",
-      }),
+    createRoom: vi.fn(
+      (opts: {
+        creation_content?: { type?: string };
+        initial_state?: Array<{ type: string; content?: { kind?: string } }>;
+      }) => {
+        if (opts.creation_content?.type === "m.space")
+          return Promise.resolve({ room_id: "!space:hs" });
+        const isControl = (opts.initial_state ?? []).some(
+          (s) => s.type === "chat4000.room_kind" && s.content?.kind === "control",
+        );
+        return Promise.resolve({ room_id: isControl ? "!control:hs" : "!starter:hs" });
+      },
     ),
     getJoinedRooms: vi.fn(() => Promise.resolve({ joined_rooms: joinedRooms })),
     sendStateEvent: vi.fn(() => Promise.resolve({ event_id: "$state" })),
@@ -56,7 +68,8 @@ describe("setupPluginRoomsWithClient (PROTOCOL C.6 step 3)", () => {
     });
 
     expect(rooms).toEqual({ spaceId: "!space:hs", controlRoomId: "!control:hs" });
-    expect(client.createRoom).toHaveBeenCalledTimes(2);
+    // C.6 step 3 creates THREE rooms: space, control, and the starter chat.
+    expect(client.createRoom).toHaveBeenCalledTimes(3);
     // C.6: BOTH rooms get m.room.encryption at creation; only the control room
     // is marked chat4000.room_kind: control, and it carries a readable name (E).
     const spaceOpts = client.createRoom.mock.calls[0]?.[0] as {
@@ -79,14 +92,57 @@ describe("setupPluginRoomsWithClient (PROTOCOL C.6 step 3)", () => {
         content: { kind: "control" },
       }),
     ]);
-    // The user is invited to both — the invites PRE-EXIST before any device pairs.
+    // The user is invited to the space + control room — the invites PRE-EXIST
+    // before any device pairs.
     expect(client.invite).toHaveBeenCalledWith("!space:hs", "@u_one:hs");
     expect(client.invite).toHaveBeenCalledWith("!control:hs", "@u_one:hs");
+    // E "The starter chat room": the third createRoom is an ordinary session
+    // room (NO chat4000.room_kind: control) that invites the user at creation.
+    const starterOpts = client.createRoom.mock.calls[2]?.[0] as {
+      invite?: string[];
+      initial_state?: Array<{ type: string; content?: { kind?: string } }>;
+    };
+    expect(starterOpts.invite).toEqual(["@u_one:hs"]);
+    expect(
+      (starterOpts.initial_state ?? []).some(
+        (s) => s.type === "chat4000.room_kind" && s.content?.kind === "control",
+      ),
+    ).toBe(false);
+    // The user is marked onboarded (durable dedupe marker) -> starter room id.
+    expect(loadOnboarded(ACCOUNT)).toEqual({ "@u_one:hs": "!starter:hs" });
     // Ids persist so the gateway (and a setup re-run) reuse the same rooms.
     expect(readPluginRooms(ACCOUNT)).toEqual({
       spaceId: "!space:hs",
       controlRoomId: "!control:hs",
     });
+  });
+
+  it("re-running setup makes NO second starter chat (onboarded-store dedupe)", async () => {
+    // First run creates space + control + ONE starter chat and marks the user.
+    const first = fakeClient([]);
+    await setupPluginRoomsWithClient(asClient(first), {
+      accountId: ACCOUNT,
+      pluginName: "chat4000",
+      userId: "@u_one:hs",
+    });
+    expect(first.createRoom).toHaveBeenCalledTimes(3);
+    expect(loadOnboarded(ACCOUNT)).toEqual({ "@u_one:hs": "!starter:hs" });
+
+    // Second run: bot is joined to space + control, and the user is already
+    // onboarded — so NO room is created at all (no second space/control via the
+    // reused ids, and crucially no second starter chat).
+    const second = fakeClient(["!space:hs", "!control:hs"]);
+    second.invite = vi.fn(() =>
+      Promise.reject(new Error("MatrixError: [403] @u_one:hs is already in the room")),
+    );
+    await setupPluginRoomsWithClient(asClient(second), {
+      accountId: ACCOUNT,
+      pluginName: "chat4000",
+      userId: "@u_one:hs",
+    });
+    expect(second.createRoom).not.toHaveBeenCalled();
+    // Still exactly one starter chat for the user.
+    expect(loadOnboarded(ACCOUNT)).toEqual({ "@u_one:hs": "!starter:hs" });
   });
 
   it("re-run is idempotent: still-joined rooms are reused, already-sent invites tolerated", async () => {

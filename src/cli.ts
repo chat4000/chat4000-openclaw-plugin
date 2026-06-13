@@ -553,9 +553,12 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
   }
   output.write(`✓ Plugin user ${ensured.created ? "created" : "ready"}: ${ensured.userId}\n`);
 
-  // PROTOCOL C.6 step 3: short-lived bot session creates the space + control
-  // room and invites the user to both — BEFORE any device pairs. No key
-  // pre-sharing, ever (single-crypto-owner rule). Idempotent on re-run.
+  // PROTOCOL C.6 step 3: short-lived bot session creates the space, control
+  // room, and ONE starter chat room (E "The starter chat room"), inviting the
+  // user to all three — BEFORE any device pairs, so a redeemed device opens to a
+  // usable chat. The starter chat is deduped per user (onboarded store), so a
+  // re-run never mints a second. No key pre-sharing, ever (single-crypto-owner
+  // rule). Idempotent on re-run.
   const rooms = await setupPluginRooms({
     credentials,
     accountId: account.accountId,
@@ -563,8 +566,8 @@ async function runSetup(api: PluginApiLike, opts: SetupCommandOptions): Promise<
     userId: ensured.userId,
   });
   output.write(
-    `✓ Space + control room ready (${rooms.spaceId}, ${rooms.controlRoomId}); ` +
-      `invited ${ensured.userId} to both.\n`,
+    `✓ Space + control room + starter chat ready (${rooms.spaceId}, ${rooms.controlRoomId}); ` +
+      `invited ${ensured.userId}.\n`,
   );
 
   await writeChannelConfig(api, {
