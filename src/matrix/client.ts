@@ -111,6 +111,71 @@ const SLIDING_TIMELINE_LIMIT = 30;
 /** How long to wait for a room key before surfacing a message as undecryptable. */
 const UTD_SURFACE_MS = 30_000;
 
+/**
+ * History horizon: how far BEFORE the client's construction instant a timeline
+ * event may be and still be processed.
+ *
+ * The bug this replaces: the old gate dropped every event with
+ * `getTs() < startedAtTs` (the construction instant). The user's very first
+ * message is sent DURING the pair → startup window, so its origin-server ts
+ * predates `startedAtTs` and was silently dropped; only the resend (clearly
+ * after startup) was delivered. Encrypted events make this worse — an
+ * `m.room.encrypted` event keeps its ORIGINAL send ts even when the room key
+ * (hence a successful decrypt) only arrives after startup, so a strictly
+ * "newer than startup" gate can discard a message that only becomes readable
+ * later.
+ *
+ * We cannot simply remove the gate: sliding sync's `timeline_limit`
+ * (SLIDING_TIMELINE_LIMIT = 30) re-emits up to 30 historical timeline events
+ * per room through `RoomEvent.Timeline` on every (re)sync, and the old ts gate
+ * was the ONLY thing stopping that backlog from being reprocessed on every
+ * (re)start. So we keep a horizon — but a GENEROUS one that comfortably covers
+ * a realistic pair → first-message window — and pair it with an in-process
+ * delivered-id de-dup so an event straddling the horizon (or re-emitted within
+ * it) is processed EXACTLY ONCE, never dropped purely for being slightly older
+ * than construction.
+ *
+ * 10 minutes: far longer than any plausible pair → first-message gap (seconds
+ * to a couple of minutes observed), short enough that a fresh start never
+ * replays genuinely old room backlog. The de-dup set makes the window safe.
+ */
+const HISTORY_HORIZON_MS = 10 * 60 * 1000;
+
+/**
+ * Decide whether a timeline event should be processed now, applying (1) a
+ * delivered-id de-dup so each event is processed at most once, and (2) a
+ * history horizon so a (re)sync's replayed backlog is not reprocessed.
+ *
+ * Pure and side-effect free EXCEPT that, when it returns `true`, it records the
+ * event id in `delivered` so a later re-emit of the same event (same id) is
+ * skipped. Extracted from the timeline handler so the gating logic is unit
+ * testable without constructing a full MatrixClientHandle.
+ *
+ * @param eventId  `event.getId()` — may be undefined for malformed events.
+ * @param ts       `event.getTs()` — the origin-server timestamp.
+ * @param horizonStart  the oldest ts still eligible (`startedAtTs - HORIZON`).
+ * @param delivered  in-memory set of event ids already admitted for processing.
+ */
+export function shouldProcessTimelineEvent(
+  eventId: string | undefined,
+  ts: number,
+  horizonStart: number,
+  delivered: Set<string>,
+): boolean {
+  // Without an id we cannot de-dup; an event with no id is not a real,
+  // first-class message we deliver to the agent, so skip it.
+  if (!eventId) return false;
+  // Already admitted once (e.g. a (re)sync re-emitted the same event) — never
+  // process the same id twice.
+  if (delivered.has(eventId)) return false;
+  // Older than the horizon: replayed backlog from a (re)sync, not a message we
+  // owe the agent. Drop it WITHOUT marking it delivered (the set is reserved
+  // for things we actually admit, keeping it bounded to live traffic).
+  if (ts < horizonStart) return false;
+  delivered.add(eventId);
+  return true;
+}
+
 export class MatrixClientHandle {
   readonly client: MatrixClient;
 
@@ -131,6 +196,24 @@ export class MatrixClientHandle {
   private readonly opts: MatrixClientHandleOptions;
 
   private readonly startedAtTs = Date.now();
+
+  /**
+   * Event ids already admitted into processing this process lifetime. Backs the
+   * de-dup half of the timeline gate (see `shouldProcessTimelineEvent`): paired
+   * with the history horizon it lets a message straddling startup be delivered
+   * exactly once, while a (re)sync's replayed timeline does not reprocess it.
+   *
+   * In-memory ON PURPOSE: across a process restart it is empty. Reprocessing is
+   * then bounded by (a) the durable sliding-sync cursor (`sync-pos.txt`), which
+   * resumes sync from where we left off, and (b) HISTORY_HORIZON_MS, which drops
+   * any replayed timeline event older than 10 minutes. The narrow window this
+   * leaves — an event inside the last `timeline_limit` AND newer than the
+   * horizon AND not yet acked at the previous shutdown — could be re-delivered
+   * once after a restart; that is the deliberate, bounded tradeoff for never
+   * dropping a real pre-startup message, and it is no worse than the prior
+   * behavior for any event newer than the old `startedAtTs` cutoff.
+   */
+  private readonly deliveredEventIds = new Set<string>();
 
   private constructor(
     client: MatrixClient,
@@ -340,8 +423,23 @@ export class MatrixClientHandle {
   private handleTimelineEvent(event: MatrixEvent): void {
     // Ignore our own echoes.
     if (event.getSender() === this.opts.credentials.userId) return;
-    // Only act on live messages, not paginated history.
-    if (event.getTs() < this.startedAtTs) return;
+    // Gate on a generous history horizon + a delivered-id de-dup instead of a
+    // hard "newer than startup" cutoff. The old cutoff silently dropped the
+    // user's first message when it was sent during the pair → startup window
+    // (its origin-server ts predated construction), and dropped any encrypted
+    // message that only became readable after a late key arrival (the wire ts
+    // stays the original send time). The horizon still prevents a (re)sync's
+    // replayed `timeline_limit` backlog from being reprocessed; the de-dup set
+    // guarantees exactly-once even for an event straddling the horizon.
+    if (
+      !shouldProcessTimelineEvent(
+        event.getId(),
+        event.getTs(),
+        this.startedAtTs - HISTORY_HORIZON_MS,
+        this.deliveredEventIds,
+      )
+    )
+      return;
 
     const deliver = (): void => {
       const command = decodeCommandEvent(event);
