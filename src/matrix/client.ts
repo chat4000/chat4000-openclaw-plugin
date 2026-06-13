@@ -90,8 +90,28 @@ export type MatrixClientHandleOptions = {
  * Live handle around a started Matrix client. `start()` resolves once the
  * initial sync completes; `stop()` tears the client down.
  */
-/** Sliding-sync shape for a plugin bot: all state + a modest timeline tail. */
-const ALL_STATE: string[][] = [["*", "*"]];
+/**
+ * Sliding-sync `required_state` for a plugin bot.
+ *
+ * Membership is LAZY in sliding sync: the `[["*","*"]]` wildcard does NOT expand
+ * to `m.room.member` (or, on the Tuwunel fork, `m.room.encryption`) — the server
+ * only returns membership when asked with the explicit `$LAZY` sentinel. Without
+ * it the SDK's `Room.currentState` never learns the room's members or that it is
+ * encrypted, so `getEncryptionTargetMembers()` resolves to `[]` and the agent
+ * Megolm-encrypts every reply for nobody → permanent UTD on the user's device.
+ *
+ * So we enumerate exactly the state we depend on, matching the working Hermes
+ * plugin's builder (chat4000-hermes-plugin `sliding_sync.build_sync_request`)
+ * against the same homeserver. `$LAZY` is sufficient: the agent only replies
+ * after the user sends, so the user is always in the lazy membership snapshot.
+ */
+const REQUIRED_STATE: string[][] = [
+  ["m.room.encryption", ""],
+  ["m.room.member", "$LAZY"],
+  ["chat4000.room_kind", ""],
+  ["m.room.name", ""],
+  ["m.space.child", "*"],
+];
 const SLIDING_TIMELINE_LIMIT = 30;
 /** How long to wait for a room key before surfacing a message as undecryptable. */
 const UTD_SURFACE_MS = 30_000;
@@ -245,11 +265,11 @@ export class MatrixClientHandle {
     const lists = new Map<string, MSC3575List>([
       [
         "chat4000",
-        { ranges: [[0, 99]], required_state: ALL_STATE, timeline_limit: SLIDING_TIMELINE_LIMIT },
+        { ranges: [[0, 99]], required_state: REQUIRED_STATE, timeline_limit: SLIDING_TIMELINE_LIMIT },
       ],
     ]);
     const roomSubscription: MSC3575RoomSubscription = {
-      required_state: ALL_STATE,
+      required_state: REQUIRED_STATE,
       timeline_limit: SLIDING_TIMELINE_LIMIT,
     };
     const slidingSync = new SlidingSync(baseUrl, lists, roomSubscription, client, 30_000);
