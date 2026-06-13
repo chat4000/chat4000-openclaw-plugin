@@ -32,6 +32,8 @@ import {
 import {
   type MSC3575List,
   type MSC3575RoomSubscription,
+  type MSC3575SlidingSyncRequest,
+  type MSC3575SlidingSyncResponse,
   SlidingSync,
 } from "matrix-js-sdk/lib/sliding-sync.js";
 import { readPackageName, readPackageVersion } from "../package-info.js";
@@ -180,9 +182,39 @@ export class MatrixClientHandle {
     });
 
     // Redirect the SDK's sliding-sync network seam to the gateway's sync frames.
-    // (`client.slidingSync` takes a proxyBaseUrl precisely so it can be pointed
-    // elsewhere; we replace the transport, not the sync logic.)
-    client.slidingSync = transport.slidingSyncRequest;
+    // (`SlidingSync` calls `client.slidingSync(req, proxyBaseUrl, signal)` — see
+    // matrix-js-sdk sliding-sync.ts — so this IS the request seam.)
+    // TEMP DIAGNOSTIC (UTD root-cause): wrap the seam to log, per room in each
+    // frame, whether the gateway delivers required_state (members +
+    // m.room.encryption). Settles upstream-Tuwunel-omits-state (frame has none)
+    // vs js-sdk-receives-but-doesn't-apply-it (frame populated yet currentState
+    // stays empty + member-arrival never fires). Remove once root-caused.
+    const rawSlidingSyncRequest = transport.slidingSyncRequest;
+    client.slidingSync = async (
+      reqBody: MSC3575SlidingSyncRequest,
+      proxyBaseUrl?: string,
+      abortSignal?: AbortSignal,
+    ): Promise<MSC3575SlidingSyncResponse> => {
+      const resp = await rawSlidingSyncRequest(reqBody, proxyBaseUrl, abortSignal);
+      try {
+        const rooms = resp.rooms ?? {};
+        for (const [rid, rd] of Object.entries(rooms)) {
+          const rs =
+            (rd as { required_state?: { type?: string; state_key?: string }[] }).required_state ??
+            [];
+          const members = rs.filter((e) => e.type === "m.room.member").length;
+          const hasEnc = rs.some((e) => e.type === "m.room.encryption");
+          const types = rs.map((e) => String(e.type)).slice(0, 14);
+          console.warn(
+            `chat4000.diag.frame room=${rid} required_state=${rs.length} members=${members} ` +
+              `enc=${hasEnc} types=[${types.join(",")}]`,
+          );
+        }
+      } catch {
+        // diagnostic must never break sync
+      }
+      return resp;
+    };
 
     // E2E is mandatory. initRustCrypto throwing here propagates and prevents the
     // channel from starting (no cleartext fallback). Crypto's own HTTP rides the
