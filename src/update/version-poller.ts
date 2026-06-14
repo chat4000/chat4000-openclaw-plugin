@@ -3,8 +3,14 @@
  *
  * The gateway-resident plugin periodically asks the registrar **which exact
  * build it should be running and where the install source is** (C.5.2), and —
- * when its installed version is not that build — installs `source` and restarts
- * into it (reusing the self-update apply/restart path in {@link applyUpdate}).
+ * when its installed version is not that build — runs the registrar-provided
+ * installer command (`source`) to upgrade.
+ *
+ * The registrar's `source` is the WHOLE installer invocation to run — e.g.
+ * `curl … | bash -s -- --openclaw-branch <ref> --no-pair --stage`. The poller
+ * runs it VERBATIM; OUR installer does the actual install AND the gateway
+ * restart. The poller never composes a command or self-installs — the registrar
+ * config owns the full command (including the env, e.g. `--stage`).
  *
  * This is distinct from the boot-time version-POLICY check (C.5.1
  * `POST /version`, force/recommend/terms): that one decides whether to refuse
@@ -13,19 +19,20 @@
  *
  *   - Cadence is env-gated and slow: **stage 60 s, prod 3600 s** — never tied to
  *     message traffic.
- *   - A pending install/restart is DEFERRED while an agent turn / relay is in
- *     flight ({@link agentTurnInFlight}); the poller re-checks on the next tick
- *     and applies once the path is clear. This honors C.5 "not on the message
- *     path": a restart never drops a live reply.
+ *   - The installer launch — which restarts the gateway and so interrupts work —
+ *     is DEFERRED while an agent turn / relay is in flight ({@link
+ *     agentTurnInFlight}); the poller re-checks on the next tick and launches
+ *     once the path is clear. This honors C.5 "not on the message path".
  *
  * Robustness: a failed/unreachable registrar check logs and retries next tick;
  * it never throws out of the timer and never crashes the plugin.
  */
+import { spawn } from "node:child_process";
+
 import { type Chat4000Env } from "../pairing/env.js";
 import { readPackageName, readPackageVersion } from "../package-info.js";
 import { type PluginVersionResult, type RegistrarClient } from "../pairing/registrar.js";
 import { agentTurnInFlight } from "../turn-tracker.js";
-import { applyUpdate } from "./apply.js";
 
 /** Poll cadence by environment (PROTOCOL C.5 "not on the message path"). */
 const POLL_INTERVAL_MS: Record<Chat4000Env, number> = {
@@ -39,11 +46,30 @@ export function pollIntervalMsForEnv(env: Chat4000Env): number {
 }
 
 /**
+ * Run the registrar-provided installer command (`source`, the C.5.2 install
+ * source) VERBATIM, detached. `source` is the whole installer invocation — e.g.
+ * `curl … | bash -s -- --openclaw-branch <ref> --no-pair --stage` — which
+ * installs the target build AND restarts the gateway. That restart kills THIS
+ * process, so we detach (`detached: true` + `unref`) and ignore stdio so the
+ * installer survives our own gateway restart. Returns false only if the process
+ * could not even be spawned (the next tick re-evaluates).
+ */
+export function launchInstaller(source: string): boolean {
+  try {
+    const child = spawn("sh", ["-c", source], { detached: true, stdio: "ignore" });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The decision a single `POST /plugin-version` result implies, given the
  * installed version. Pure + side-effect-free so it is unit-testable on its own.
  *
  *   - `noop`    — installed version already equals `current_version`.
- *   - `update`  — versions differ; install `source` and restart into it.
+ *   - `update`  — versions differ; run `source` to upgrade.
  */
 export type VersionPollDecision =
   | { kind: "noop"; installedVersion: string; currentVersion: string }
@@ -56,9 +82,9 @@ export type VersionPollDecision =
 
 /**
  * PROTOCOL C.5.2 caller rule: the plugin must either already be **exactly**
- * `current_version`, or install `source` and restart into it. Exact string
- * compare (the registrar names the precise build; this is not a semver "newer"
- * test — a pin-down/rollback names an older version and must still apply).
+ * `current_version`, or run `source` to upgrade into it. Exact string compare
+ * (the registrar names the precise build; this is not a semver "newer" test — a
+ * pin-down/rollback names an older version and must still apply).
  */
 export function decideVersionPoll(
   installedVersion: string,
@@ -88,8 +114,8 @@ export type VersionPollerOptions = {
   report?: (err: unknown, where: string) => void;
   /** Injectable installed-version reader (defaults to the package.json version). */
   readInstalledVersion?: () => string;
-  /** Injectable apply (defaults to {@link applyUpdate}); for tests. */
-  apply?: typeof applyUpdate;
+  /** Injectable installer launcher (defaults to {@link launchInstaller}); for tests. */
+  launchInstaller?: (source: string) => boolean;
   /** Injectable "is a relay in flight" gate (defaults to {@link agentTurnInFlight}). */
   isTurnInFlight?: () => boolean;
 };
@@ -144,7 +170,8 @@ export class VersionPoller {
 
   /**
    * One poll: ask the registrar (C.5.2), decide, and — if an update is due —
-   * apply it UNLESS a relay is in flight (defer to the next tick). Never throws.
+   * launch the installer UNLESS a relay is in flight (defer to the next tick).
+   * Never throws.
    */
   async tick(): Promise<void> {
     try {
@@ -159,8 +186,8 @@ export class VersionPoller {
         return;
       }
 
-      // PROTOCOL C.5: defer the restart while a turn/relay is in flight so we
-      // never drop a live reply. Re-checked on the next tick.
+      // PROTOCOL C.5: defer the installer (which restarts the gateway) while a
+      // turn/relay is in flight so we never drop a live reply. Re-checked next tick.
       const isTurnInFlight = this.opts.isTurnInFlight ?? agentTurnInFlight;
       if (isTurnInFlight()) {
         this.opts.log?.("runtime.version_poll_deferred", {
@@ -176,24 +203,13 @@ export class VersionPoller {
         to: decision.currentVersion,
         source: decision.source,
       });
-      const apply = this.opts.apply ?? applyUpdate;
-      const res = await apply({
-        targetVersion: decision.currentVersion,
-        source: decision.source,
-        force: true,
-        restart: true,
-        trigger: "command",
-        log: (line) => this.opts.log?.("runtime.version_poll_log", { detail: line }),
-      });
-      this.opts.log?.("runtime.version_poll_applied", {
-        ok: res.ok,
-        installed: res.installed,
-        restart_scheduled: res.restartScheduled,
-        reason: res.reason,
-      });
-      // A scheduled restart will replace this process shortly; stop polling so we
-      // don't fire another install in the gap before the restart lands.
-      if (res.restartScheduled) this.stop();
+      const launch = this.opts.launchInstaller ?? launchInstaller;
+      const ok = launch(decision.source);
+      this.opts.log?.("runtime.version_poll_launched", { ok, source: decision.source });
+      // On a successful launch the installer will install + restart the gateway,
+      // replacing this process shortly; stop polling so we don't fire another
+      // launch in the gap. On a failed launch, keep polling to retry next tick.
+      if (ok) this.stop();
     } catch (err) {
       // Robust: a failed/unreachable check logs and retries next tick.
       this.opts.log?.("runtime.version_poll_error", { error: String(err) });
