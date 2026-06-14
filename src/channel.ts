@@ -49,9 +49,17 @@ import { checkPluginVersion, formatVersionNotice } from "./pairing/version-check
 import { RuntimeLogger } from "./runtime-logger.js";
 import { applyUpdate } from "./update/apply.js";
 import { reconcileUpdateMarker } from "./update/boot-guard.js";
+import { VersionPoller } from "./update/version-poller.js";
+import { resolveEnv } from "./pairing/env.js";
+import { beginAgentTurn, endAgentTurn } from "./turn-tracker.js";
 import { getChat4000SessionBinding } from "./session-binding.js";
 import { report } from "./telemetry.js";
-import { emitPluginBootAnalytics, registerPairedClientId, track } from "./analytics.js";
+import {
+  emitPluginBootAnalytics,
+  machineClientId,
+  registerPairedClientId,
+  track,
+} from "./analytics.js";
 import { snapshotContainerRebuilt } from "./machine-ids.js";
 import { DevicePairingManager } from "./device-pairing.js";
 import type { ResolvedChat4000Account } from "./types.js";
@@ -64,6 +72,10 @@ let pluginStartedEmitted = false;
 // PROTOCOL E device pairing: one manager per live account, created at gateway
 // boot (when a registrar is configured) and disposed at shutdown.
 const devicePairingManagers = new Map<string, DevicePairingManager>();
+
+// PROTOCOL C.5.2: one resident version poller per live account, started at
+// gateway boot (when a registrar is configured) and stopped at shutdown.
+const versionPollers = new Map<string, VersionPoller>();
 
 type ReplyPipelineRuntime = {
   createChannelReplyPipeline: (params: {
@@ -378,6 +390,28 @@ export const chat4000Plugin = {
             // Resume polling every outstanding code from the persistent store
             // (codes registered before a restart, or by the CLI at install).
             manager.resume();
+
+            // PROTOCOL C.5.2: the resident plugin-version poller. It asks
+            // `POST /plugin-version` (SERVICE-token auth) on an env-gated cadence
+            // — stage 60 s, prod 3600 s — and installs `source` + restarts into
+            // it when the installed build differs, DEFERRING the restart while an
+            // agent turn is in flight (C.5 "not on the message path"). Started
+            // only when a service token is available; never blocks boot.
+            if (provisioning.serviceToken) {
+              const env = resolveEnv(ctx.account.config.env);
+              const poller = new VersionPoller({
+                registrar: new RegistrarClient({
+                  baseUrl: provisioning.url,
+                  serviceToken: provisioning.serviceToken,
+                }),
+                env,
+                clientId: machineClientId(), // X-Client-Id = agent_install_id (null when telemetry off)
+                log: (event, fields) => runtimeLogger.info(event, fields ?? {}),
+                report,
+              });
+              versionPollers.set(ctx.account.accountId, poller);
+              poller.start();
+            }
           }
         } catch (err) {
           ctx.log?.warn?.(
@@ -395,6 +429,8 @@ export const chat4000Plugin = {
         ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
       });
       await handle.stop();
+      versionPollers.get(ctx.account.accountId)?.stop();
+      versionPollers.delete(ctx.account.accountId);
       devicePairingManagers.get(ctx.account.accountId)?.dispose();
       devicePairingManagers.delete(ctx.account.accountId);
       unregisterHandle(ctx.account.accountId);
@@ -764,6 +800,26 @@ async function saveInboundMedia(
 }
 
 async function dispatchToAgent(params: {
+  message: MatrixInboundMessage;
+  bodyText: string;
+  media?: { path: string; contentType?: string | undefined } | undefined;
+  handle: MatrixClientHandle;
+  ctx: InboundCtx;
+  runtimeLogger: RuntimeLogger;
+}): Promise<void> {
+  // PROTOCOL C.5: mark this relay as in flight so the resident version poller
+  // (C.5.2) defers any self-update RESTART until the turn finishes — a restart
+  // mid-relay would drop the in-flight reply. Always released in the finally,
+  // however the turn ends (success, error, abort).
+  beginAgentTurn();
+  try {
+    await dispatchToAgentInner(params);
+  } finally {
+    endAgentTurn();
+  }
+}
+
+async function dispatchToAgentInner(params: {
   message: MatrixInboundMessage;
   bodyText: string;
   media?: { path: string; contentType?: string | undefined } | undefined;

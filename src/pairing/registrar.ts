@@ -14,11 +14,14 @@
  *                                                       client_id?, redeems[],
  *                                                       redeemed_count, expires_at? } (C.3.3)
  *   POST /version            (public)                 -> version policy verdict   (C.5.1)
+ *   POST /plugin-version     (bearer SERVICE_TOKEN)   -> { current_version,
+ *                                                       source }                  (C.5.2)
  *
  * Identity (PROTOCOL B): there is NO `plugin_id`. The bot MXID returned by
  * `POST /plugins` IS the plugin identity; the plugin's one user is DERIVED by
  * the registrar from the bot MXID at `PUT /user`. The auth split (C.4):
- *   - SERVICE_TOKEN gates ONLY `POST /plugins` (birthing a bot).
+ *   - SERVICE_TOKEN gates `POST /plugins` (birthing a bot) and `POST /plugin-version`
+ *     (the plugin-only install-source check, C.5.2).
  *   - the BOT access token gates `PUT /user`, `POST /codes`, `GET /codes/{code}`
  *     (whoami-verified to be `@plugin_.*` on every call).
  *   - `POST /codes/{code}/redeem` and `POST /version` are public.
@@ -122,6 +125,18 @@ export type VersionPolicyResult = {
   recommended: string | null;
   currentTermsVersion: number;
   message: string | null;
+};
+
+/**
+ * PROTOCOL C.5.2 `POST /plugin-version` result — the exact build this caller
+ * should be running and the install source for it. Plugin-only (service-token
+ * auth); carries no policy/nag/terms.
+ */
+export type PluginVersionResult = {
+  /** The exact plugin version this caller should be running. */
+  currentVersion: string;
+  /** The repo / image ref that installs `currentVersion`. */
+  source: string;
 };
 
 export class RegistrarError extends Error {
@@ -323,6 +338,35 @@ export class RegistrarClient {
       currentTermsVersion:
         typeof body.current_terms_version === "number" ? body.current_terms_version : 0,
       message: typeof body.message === "string" ? body.message : null,
+    };
+  }
+
+  /**
+   * PROTOCOL C.5.2 `POST /plugin-version` — which exact build this caller should
+   * be running, and the install source for it. SERVICE-TOKEN auth (plugin-only;
+   * this endpoint returns no policy/nag/terms). The registrar answers one
+   * question: `current_version` + `source`. The caller then either already IS
+   * `current_version` (no-op) or installs `source` and restarts into it.
+   */
+  async checkPluginVersion(params: {
+    appId: string;
+    /**
+     * The machine analytics id (= agent_install_id) — rides ONLY as the
+     * `X-Client-Id` header (the canonical carrier; no `posthog_id` body field).
+     * It is the gradual-rollout cohort key (C.5.2). Pass null/undefined when
+     * telemetry is off so the id never rides and the caller can't enter a
+     * partial rollout.
+     */
+    clientId?: string | null | undefined;
+  }): Promise<PluginVersionResult> {
+    const body = (await this.request("POST", "/plugin-version", {
+      auth: "service",
+      clientId: params.clientId,
+      body: { app_id: params.appId },
+    })) as Record<string, unknown>;
+    return {
+      currentVersion: String(body.current_version),
+      source: String(body.source),
     };
   }
 

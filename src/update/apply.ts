@@ -30,6 +30,14 @@ const run = promisify(execFile);
 export type ApplyUpdateOptions = {
   /** Install this exact version. Defaults to the preflight's latest. */
   targetVersion?: string | undefined;
+  /**
+   * PROTOCOL C.5.2 `source` — the repo / image ref the registrar says installs
+   * the target version (e.g. `github:chat4000/openclaw-plugin#v2.0.0` or a
+   * `pkg@version` spec). When set it is installed verbatim, bypassing the npm
+   * preflight (the registrar, not `npm view`, decides the build here). Still
+   * records `targetVersion` as the to-version on the result + boot marker.
+   */
+  source?: string | undefined;
   /** Update even if preflight says not updatable (still requires a target). */
   force?: boolean | undefined;
   /** Restart the gateway after install so the new code loads. */
@@ -67,8 +75,21 @@ async function installVersion(
   timeoutMs: number,
   log: (l: string) => void,
 ): Promise<boolean> {
+  return installSpec(`${packageName}@${version}`, timeoutMs, log);
+}
+
+/**
+ * Install an arbitrary plugin install spec via the OpenClaw CLI. The spec is
+ * either a `pkg@version` (npm) or a PROTOCOL C.5.2 `source` ref (e.g.
+ * `github:owner/repo#ref`) — both are forwarded verbatim to
+ * `openclaw plugins install --force <spec>`.
+ */
+async function installSpec(
+  spec: string,
+  timeoutMs: number,
+  log: (l: string) => void,
+): Promise<boolean> {
   const openclaw = resolveOpenclawBin();
-  const spec = `${packageName}@${version}`;
   // Current CLI is `plugins install`; older is `plugin install`. Try both.
   for (const sub of [
     ["plugins", "install", "--force", spec],
@@ -151,7 +172,11 @@ export async function applyUpdate(opts: ApplyUpdateOptions = {}): Promise<ApplyU
     };
   }
 
-  if (!preflight.updatable && !opts.force) {
+  // PROTOCOL C.5.2: when the registrar names a `source`, IT decides the build —
+  // the npm-based `updatable` preflight gate does not apply (the source can be a
+  // git/image ref npm never sees). The preflight still supplies `currentVersion`
+  // and the restart method; we just don't gate on `newerAvailable`.
+  if (!opts.source && !preflight.updatable && !opts.force) {
     return {
       ok: false,
       fromVersion: preflight.currentVersion,
@@ -178,7 +203,11 @@ export async function applyUpdate(opts: ApplyUpdateOptions = {}): Promise<ApplyU
     await flushAnalytics();
   }
 
-  const installed = await installVersion(packageName, target, timeoutMs, log);
+  // PROTOCOL C.5.2: install the registrar's `source` ref verbatim when given;
+  // otherwise install the pinned `pkg@version` (the legacy/command path).
+  const installed = opts.source
+    ? await installSpec(opts.source, timeoutMs, log)
+    : await installVersion(packageName, target, timeoutMs, log);
   if (!installed) {
     return {
       ok: false,

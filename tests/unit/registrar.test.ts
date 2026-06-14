@@ -397,4 +397,72 @@ describe("RegistrarClient", () => {
       message: "please upgrade",
     });
   });
+
+  it("checkPluginVersion POSTs /plugin-version with the SERVICE token + app_id, maps current_version/source (PROTOCOL C.5.2)", async () => {
+    let captured: { url: string; init: RequestInit } | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch((url, init) => {
+        captured = { url, init };
+        return {
+          status: 200,
+          body: {
+            current_version: "2.0.0",
+            source: "github:chat4000/openclaw-plugin#v2.0.0",
+          },
+        };
+      }),
+    });
+
+    const res = await client.checkPluginVersion({
+      appId: "@chat4000/openclaw-plugin",
+      clientId: "agent-install-id-123",
+    });
+
+    expect(captured?.url).toBe("https://registrar.chat4000.com/plugin-version");
+    // SERVICE-token auth (plugin-only endpoint, C.5.2/C.4).
+    expect((captured?.init.headers as Record<string, string>).Authorization).toBe(
+      "Bearer svc-token",
+    );
+    // X-Client-Id carries the agent_install_id (canonical carrier, no posthog_id body).
+    expect((captured?.init.headers as Record<string, string>)["X-Client-Id"]).toBe(
+      "agent-install-id-123",
+    );
+    const body = JSON.parse(bodyText(captured?.init.body));
+    expect(body).toEqual({ app_id: "@chat4000/openclaw-plugin" });
+    expect(body).not.toHaveProperty("posthog_id");
+    expect(res).toEqual({
+      currentVersion: "2.0.0",
+      source: "github:chat4000/openclaw-plugin#v2.0.0",
+    });
+  });
+
+  it("checkPluginVersion omits X-Client-Id when telemetry is off (clientId null) (C.5.2)", async () => {
+    let captured: RequestInit | undefined;
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      serviceToken: "svc-token",
+      fetchImpl: mockFetch((_url, init) => {
+        captured = init;
+        return { status: 200, body: { current_version: "2.0.0", source: "pkg@2.0.0" } };
+      }),
+    });
+
+    await client.checkPluginVersion({ appId: "@chat4000/openclaw-plugin", clientId: null });
+    expect((captured?.headers as Record<string, string>)["X-Client-Id"]).toBeUndefined();
+  });
+
+  it("checkPluginVersion without a service token throws before any fetch (C.4)", async () => {
+    const fetchImpl = vi.fn();
+    const client = new RegistrarClient({
+      baseUrl: "https://registrar.chat4000.com",
+      botAccessToken: "bot-token",
+      fetchImpl,
+    });
+    await expect(client.checkPluginVersion({ appId: "@chat4000/openclaw-plugin" })).rejects.toThrow(
+      /SERVICE_TOKEN/,
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
