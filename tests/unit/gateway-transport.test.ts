@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GatewayTransport, gatewayToBaseUrl } from "../../src/matrix/gateway-transport.js";
@@ -132,6 +132,9 @@ describe("GatewayTransport", () => {
     ws.close();
     const err = await respP;
     expect(err).toBeInstanceOf(Error);
+    // dispose() cancels the reconnect timer onClose scheduled — without this the
+    // transport would open a stray socket ~500ms later, polluting a later test.
+    transport.dispose();
   });
 
   it("routes media paths to real HTTP, not the WS (PROTOCOL D.3)", async () => {
@@ -192,7 +195,8 @@ describe("GatewayTransport", () => {
       expect(flush).toHaveBeenCalledTimes(1);
       const ack = ws.frames().find((f) => f.t === "sync_ack");
       expect(ack?.pos).toBe("p1");
-      expect(readFileSync(posFile, "utf8")).toBe("p1");
+      // Cursors persist as one JSON object; this batch carried no to_device_pos.
+      expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({ pos: "p1" });
       transport.dispose();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -225,6 +229,238 @@ describe("GatewayTransport", () => {
 
     expect(flush).not.toHaveBeenCalled();
     expect(ws.frames().find((f) => f.t === "sync_ack")?.pos).toBe("p2");
+    transport.dispose();
+  });
+
+  it("persists to_device_pos atomically with keys and acks BOTH cursors (PROTOCOL D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const flush = vi.fn(() => Promise.resolve(undefined));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-td-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        flushBeforeAck: flush,
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      const p1 = transport.slidingSyncRequest({ lists: {} });
+      ws.emit("message", {
+        data: JSON.stringify({
+          t: "sync",
+          pos: "r1",
+          to_device_pos: "t1",
+          lists: {},
+          rooms: {},
+          extensions: { to_device: { events: [{ type: "m.room.encrypted" }] } },
+        }),
+      });
+      await p1;
+
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(flush).toHaveBeenCalledTimes(1);
+      const ack = ws.frames().find((f) => f.t === "sync_ack");
+      expect(ack).toMatchObject({ pos: "r1", to_device_pos: "t1" });
+      expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({
+        pos: "r1",
+        to_device_pos: "t1",
+      });
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT ack to_device_pos until the key flush resolves (PROTOCOL D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const flush = vi.fn(() => gate);
+    const transport = new GatewayTransport({
+      gatewayUrl: "wss://gateway.chat4000.com/ws",
+      accessToken: "syt",
+      flushBeforeAck: flush,
+    });
+    const connectP = transport.connect();
+    const ws = FakeWebSocket.instances[0];
+    ws.emit("open", {});
+    ws.emit("message", {
+      data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+    });
+    await connectP;
+
+    const p1 = transport.slidingSyncRequest({ lists: {} });
+    ws.emit("message", {
+      data: JSON.stringify({
+        t: "sync",
+        pos: "r1",
+        to_device_pos: "t1",
+        lists: {},
+        rooms: {},
+        extensions: { to_device: { events: [{ type: "m.room.encrypted" }] } },
+      }),
+    });
+    await p1;
+
+    void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 0));
+    // Flush is in flight (unresolved) → the ack MUST NOT have been sent yet.
+    expect(flush).toHaveBeenCalledTimes(1);
+    expect(ws.frames().some((f) => f.t === "sync_ack")).toBe(false);
+
+    release();
+    await new Promise((r) => setTimeout(r, 0));
+    const ack = ws.frames().find((f) => f.t === "sync_ack");
+    expect(ack).toMatchObject({ pos: "r1", to_device_pos: "t1" });
+    transport.dispose();
+  });
+
+  it("carries the last to_device_pos forward on a frame with no to-device section (D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const flush = vi.fn(() => Promise.resolve(undefined));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-cf-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        flushBeforeAck: flush,
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      // Frame 1 advances the to-device cursor to t1 (carries keys).
+      const p1 = transport.slidingSyncRequest({ lists: {} });
+      ws.emit("message", {
+        data: JSON.stringify({
+          t: "sync",
+          pos: "r1",
+          to_device_pos: "t1",
+          lists: {},
+          rooms: {},
+          extensions: { to_device: { events: [{ type: "m.room.encrypted" }] } },
+        }),
+      });
+      await p1;
+
+      // Frame 2 has NO to-device section — only the room cursor moves.
+      const p2 = transport.slidingSyncRequest({ lists: {} }); // this acks frame 1
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync", pos: "r2", lists: {}, rooms: {}, extensions: {} }),
+      });
+      await p2;
+
+      // A third request acks frame 2 → to_device_pos carried forward as t1.
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+
+      const acks = ws.frames().filter((f) => f.t === "sync_ack");
+      expect(acks.at(-1)).toMatchObject({ pos: "r2", to_device_pos: "t1" });
+      expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({
+        pos: "r2",
+        to_device_pos: "t1",
+      });
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes from persisted pos AND to_device_pos in sync_start (device is source of truth)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-rs-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      writeFileSync(posFile, JSON.stringify({ pos: "r9", to_device_pos: "t9" }), "utf8");
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+      const start = ws.frames().find((f) => f.t === "sync_start");
+      expect(start).toMatchObject({ pos: "r9", to_device_pos: "t9" });
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resends both cursors in sync_start after a dropped socket reconnects (D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const flush = vi.fn(() => Promise.resolve(undefined));
+    const transport = new GatewayTransport({
+      gatewayUrl: "wss://gateway.chat4000.com/ws",
+      accessToken: "syt",
+      flushBeforeAck: flush,
+    });
+    const connectP = transport.connect();
+    const ws = FakeWebSocket.instances[0];
+    ws.emit("open", {});
+    ws.emit("message", {
+      data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+    });
+    await connectP;
+
+    const p1 = transport.slidingSyncRequest({ lists: {} });
+    await new Promise((r) => setTimeout(r, 0));
+    ws.emit("message", {
+      data: JSON.stringify({
+        t: "sync",
+        pos: "r1",
+        to_device_pos: "t1",
+        lists: {},
+        rooms: {},
+        extensions: { to_device: { events: [{ type: "m.room.encrypted" }] } },
+      }),
+    });
+    await p1;
+    // Ack frame 1 so both cursors become durable, then drop the socket.
+    void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 0));
+    const beforeReconnect = FakeWebSocket.instances.length;
+    ws.close();
+
+    // Wait out the reconnect backoff (~500ms + jitter), then drive the new socket
+    // (indexed from the count before close, so it's robust to any stray instance).
+    await new Promise((r) => setTimeout(r, 900));
+    const ws2 = FakeWebSocket.instances[beforeReconnect];
+    expect(ws2).toBeTruthy();
+    ws2.emit("open", {});
+    ws2.emit("message", {
+      data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const start = ws2.frames().find((f) => f.t === "sync_start");
+    expect(start).toMatchObject({ pos: "r1", to_device_pos: "t1" });
     transport.dispose();
   });
 

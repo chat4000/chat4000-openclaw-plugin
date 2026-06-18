@@ -18,7 +18,7 @@
  * Reconnect/backoff, re-auth, and request/sync correlation live here. No Matrix
  * semantics and no encryption — those stay in the SDK.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
   MSC3575SlidingSyncRequest,
@@ -49,14 +49,20 @@ export type GatewayTransportOptions = {
   /** Identity reported on the first auth frame (drives the gateway version gate). */
   clientIdentity?: GatewayClientIdentity;
   /**
-   * File where the last durably-acked sync `pos` is persisted (PROTOCOL D.2).
-   * Loaded on construction → resent in `sync_start`; rewritten before each ack.
+   * File where the last durably-acked sync cursors are persisted (PROTOCOL D.2).
+   * Holds BOTH the room cursor (`pos`) and the to-device cursor (`to_device_pos`)
+   * as one JSON object `{ pos, to_device_pos }`, so they advance atomically (a
+   * single write) and resume together. Loaded on construction → both resent in
+   * `sync_start`; rewritten (after the crypto flush) before each ack. A legacy
+   * bare-`pos` string file is still read (to_device_pos starts empty).
    */
   posFilePath?: string;
   /**
    * Flush the crypto store to durable storage. Called BEFORE `sync_ack` for any
    * batch that carried to-device keys, so the gateway only deletes server-side
-   * room keys we have already saved (PROTOCOL D.2).
+   * room keys we have already saved (PROTOCOL D.2). The to-device cursor is
+   * persisted only AFTER this resolves, so a crash can at worst force idempotent
+   * re-delivery of keys we already saved — never deletion of unsaved keys.
    */
   flushBeforeAck?: (() => Promise<void>) | undefined;
   log?: Logger | undefined;
@@ -151,11 +157,21 @@ export class GatewayTransport {
   /** Latest pos seen on any frame (for the empty-delta fallback). */
   private lastPos: string | undefined;
 
-  /** Last pos we durably persisted + acked — the resume point sent in sync_start. */
+  /** Last room cursor we durably persisted + acked — resume point in sync_start. */
   private ackedPos: string | undefined;
 
+  /**
+   * Last to-device cursor we durably persisted + acked (PROTOCOL D.2). Tracked
+   * SEPARATELY from `ackedPos` — the two are independent server-side cursors and
+   * the to-device one is NEVER derived from `pos`. Carried forward across frames
+   * that have no to-device section, and resent in `sync_start` on reconnect.
+   */
+  private ackedToDevicePos: string | undefined;
+
   /** The last frame DELIVERED to the SDK, awaiting ack on its next sync request. */
-  private pendingAck: { pos: string; hadKeys: boolean } | undefined;
+  private pendingAck:
+    | { pos: string; toDevicePos: string | undefined; hadKeys: boolean }
+    | undefined;
 
   /** Resolver for the in-progress (re)connect's auth handshake. */
   private authSettle: { resolve: () => void; reject: (e: Error) => void } | undefined;
@@ -170,7 +186,9 @@ export class GatewayTransport {
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
     this.syncTimeoutMs = opts.syncTimeoutMs ?? 30_000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
-    this.ackedPos = this.loadPersistedPos();
+    const persisted = this.loadPersistedCursors();
+    this.ackedPos = persisted.pos;
+    this.ackedToDevicePos = persisted.toDevicePos;
   }
 
   /** Open the socket and resolve once the gateway accepts our `auth` frame. */
@@ -444,22 +462,36 @@ export class GatewayTransport {
 
   private sendSyncStart(body: unknown): void {
     const frame: Record<string, unknown> = { t: "sync_start", body };
-    // Resume from the last DURABLY-acked pos (not lastPos, which may include an
-    // un-persisted batch) so the homeserver re-delivers any keys we hadn't saved.
+    // Resume from the last DURABLY-acked cursors (not lastPos, which may include
+    // an un-persisted batch) so the homeserver re-delivers any keys we hadn't
+    // saved. BOTH cursors are the device's source of truth (PROTOCOL D.2): the
+    // gateway holds neither across reconnects. `to_device_pos` is independent of
+    // `pos` — omit it only when we've never durably acked one.
     if (this.ackedPos) frame.pos = this.ackedPos;
+    if (this.ackedToDevicePos) frame.to_device_pos = this.ackedToDevicePos;
     this.safeSend(frame);
   }
 
   /** Record the frame just handed to the SDK; it gets acked on the next request. */
   private markPending(resp: MSC3575SlidingSyncResponse): void {
-    if (typeof resp.pos === "string") {
-      this.pendingAck = { pos: resp.pos, hadKeys: respHasToDevice(resp) };
-    }
+    if (typeof resp.pos !== "string") return;
+    // `to_device_pos` is present only when THIS batch advanced the to-device
+    // cursor (the gateway lifts it from extensions.to_device.next_batch). When
+    // absent we carry the last acked value forward at ack time, never derive it
+    // from `pos` (PROTOCOL D.2).
+    this.pendingAck = {
+      pos: resp.pos,
+      toDevicePos: readToDevicePos(resp),
+      hadKeys: respHasToDevice(resp),
+    };
   }
 
   /**
-   * Flush crypto (if the pending batch carried keys) and `sync_ack` it (D.2).
-   * Restores the pending state on failure so the next request retries.
+   * Flush crypto (if the pending batch carried keys), persist BOTH cursors, then
+   * `sync_ack` them (PROTOCOL D.2). Order is correctness-critical: keys are on
+   * durable storage (flush) BEFORE the to-device cursor is persisted/acked, so we
+   * never ack a `to_device_pos` whose keys aren't saved. Restores the pending
+   * state on failure so the next request retries.
    */
   private async flushAndAckPending(): Promise<void> {
     const pending = this.pendingAck;
@@ -467,31 +499,63 @@ export class GatewayTransport {
     this.pendingAck = undefined;
     try {
       if (pending.hadKeys && this.flushBeforeAck) await this.flushBeforeAck();
-      this.persistAckedPos(pending.pos);
-      this.safeSend({ t: "sync_ack", pos: pending.pos });
+      // Carry the last durable to-device cursor forward when this frame had no
+      // to-device section, so every ack reports the latest one we hold (D.2).
+      const toDevicePos = pending.toDevicePos ?? this.ackedToDevicePos;
+      this.persistAckedCursors(pending.pos, toDevicePos);
+      const ack: Record<string, unknown> = { t: "sync_ack", pos: pending.pos };
+      // Omit to_device_pos only if we've never received one — absent leaves the
+      // gateway's to-device cursor unchanged.
+      if (toDevicePos !== undefined) ack.to_device_pos = toDevicePos;
+      this.safeSend(ack);
     } catch (err) {
       this.pendingAck = pending; // not persisted → retry on the next request
       this.log?.warn?.(`sync_ack flush failed (will retry): ${String(err)}`);
     }
   }
 
-  private loadPersistedPos(): string | undefined {
-    if (!this.posFilePath || !existsSync(this.posFilePath)) return undefined;
+  private loadPersistedCursors(): { pos: string | undefined; toDevicePos: string | undefined } {
+    if (!this.posFilePath || !existsSync(this.posFilePath)) {
+      return { pos: undefined, toDevicePos: undefined };
+    }
     try {
-      return readFileSync(this.posFilePath, "utf8").trim() || undefined;
+      const raw = readFileSync(this.posFilePath, "utf8").trim();
+      if (!raw) return { pos: undefined, toDevicePos: undefined };
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (parsed && typeof parsed === "object") {
+          const o = parsed as { pos?: unknown; to_device_pos?: unknown };
+          return {
+            pos: typeof o.pos === "string" ? o.pos : undefined,
+            toDevicePos: typeof o.to_device_pos === "string" ? o.to_device_pos : undefined,
+          };
+        }
+      } catch {
+        // Legacy format: a bare `pos` string (no to-device cursor yet).
+      }
+      return { pos: raw, toDevicePos: undefined };
     } catch {
-      return undefined;
+      return { pos: undefined, toDevicePos: undefined };
     }
   }
 
-  private persistAckedPos(pos: string): void {
+  /**
+   * Persist both cursors as one atomic write (temp file + rename) so a crash
+   * mid-write can never leave a half-written/corrupt cursor file (PROTOCOL D.2:
+   * "durably AND atomically"). The two cursors always land together.
+   */
+  private persistAckedCursors(pos: string, toDevicePos: string | undefined): void {
     this.ackedPos = pos;
+    this.ackedToDevicePos = toDevicePos;
     if (!this.posFilePath) return;
     try {
       mkdirSync(path.dirname(this.posFilePath), { recursive: true });
-      writeFileSync(this.posFilePath, pos, "utf8");
+      const payload = toDevicePos !== undefined ? { pos, to_device_pos: toDevicePos } : { pos };
+      const tmp = `${this.posFilePath}.tmp`;
+      writeFileSync(tmp, JSON.stringify(payload), "utf8");
+      renameSync(tmp, this.posFilePath);
     } catch (err) {
-      this.log?.warn?.(`sync pos persist failed: ${String(err)}`);
+      this.log?.warn?.(`sync cursor persist failed: ${String(err)}`);
     }
   }
 
@@ -562,6 +626,15 @@ function respHasToDevice(resp: MSC3575SlidingSyncResponse): boolean {
   if (!ext) return false;
   const td = (ext.to_device ?? ext["m.to_device"]) as { events?: unknown[] } | undefined;
   return Array.isArray(td?.events) && td.events.length > 0;
+}
+
+/**
+ * The to-device cursor the gateway lifted onto the top level of this `sync` frame
+ * (PROTOCOL D.1) — present only when the batch advanced the to-device cursor.
+ */
+function readToDevicePos(resp: MSC3575SlidingSyncResponse): string | undefined {
+  const v = (resp as { to_device_pos?: unknown }).to_device_pos;
+  return typeof v === "string" ? v : undefined;
 }
 
 const SEND_EVENT_PATH = /\/rooms\/[^/]+\/send\/(m\.room\.encrypted|m\.room\.message)\/([^/?]+)/;
