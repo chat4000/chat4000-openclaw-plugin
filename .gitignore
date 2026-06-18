@@ -3,5 +3,4 @@ dist/
 *.swp
 *~
 .DS_Store
-src/telemetry-dsn.generated.ts
 __pycache__/
