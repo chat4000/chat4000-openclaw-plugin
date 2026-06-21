@@ -18,7 +18,7 @@
  * Reconnect/backoff, re-auth, and request/sync correlation live here. No Matrix
  * semantics and no encryption — those stay in the SDK.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
   MSC3575SlidingSyncRequest,
@@ -168,9 +168,14 @@ export class GatewayTransport {
    */
   private ackedToDevicePos: string | undefined;
 
-  /** The last frame DELIVERED to the SDK, awaiting ack on its next sync request. */
+  /**
+   * The last frame DELIVERED to the SDK, awaiting ack on its next sync request.
+   * `pos` is normally the batch's room cursor, but becomes `undefined` if a
+   * `sync_reset` dropped the room cursor before this batch could be acked — the
+   * ack then carries only the to-device cursor (PROTOCOL D.2 cursor expiry).
+   */
   private pendingAck:
-    | { pos: string; toDevicePos: string | undefined; hadKeys: boolean }
+    | { pos: string | undefined; toDevicePos: string | undefined; hadKeys: boolean }
     | undefined;
 
   /** Resolver for the in-progress (re)connect's auth handshake. */
@@ -361,6 +366,10 @@ export class GatewayTransport {
         this.onSyncFrame(frame);
         return;
       }
+      case "sync_reset": {
+        this.onSyncReset(frame);
+        return;
+      }
       default:
         this.log?.debug?.(`gateway sent unknown frame "${String(t)}"`);
     }
@@ -384,6 +393,76 @@ export class GatewayTransport {
       this.syncQueue.shift();
       this.log?.warn?.("gateway sync backlog exceeded; dropped oldest delta");
     }
+  }
+
+  /**
+   * Handle a `sync_reset` frame (PROTOCOL D.1/D.2 "Cursor expiry recovery").
+   *
+   * The homeserver expired the room cursor (`M_UNKNOWN_POS`); the gateway has
+   * ALREADY dropped the named cursor(s) and re-initialised the upstream sync from
+   * scratch on THIS SAME socket. Our job is narrow and exact:
+   *
+   *   - Immediately discard from DURABLE storage exactly the cursor(s) the frame
+   *     names — for `pos_expired` that is the room `pos` ONLY — so a later
+   *     reconnect cannot replay a stale `pos` and re-trigger `M_UNKNOWN_POS`.
+   *   - KEEP every cursor NOT named (a `pos_expired` reset names `["pos"]`, leaving
+   *     `to_device_pos` intact — it is a separate, durable stream token the expiry
+   *     does NOT invalidate).
+   *   - Do NOT tear down crypto state, and do NOT send a new `sync_start`. We keep
+   *     consuming the fresh `sync` frames already streaming on this socket; their
+   *     new `pos` is persisted through the normal ack flow.
+   */
+  private onSyncReset(frame: Record<string, unknown>): void {
+    const reason = str(frame.reason, "unknown");
+    const cursors = Array.isArray(frame.cursors)
+      ? frame.cursors.filter((c): c is string => typeof c === "string")
+      : [];
+    this.log?.info?.(`gateway sync_reset (reason=${reason}, cursors=[${cursors.join(", ")}])`);
+
+    const dropPos = cursors.includes("pos");
+    const dropToDevice = cursors.includes("to_device_pos");
+    if (!dropPos && !dropToDevice) {
+      this.log?.warn?.(
+        `gateway sync_reset named no known cursor (cursors=[${cursors.join(", ")}])`,
+      );
+      return;
+    }
+
+    if (dropPos) {
+      // The room cursor is gone server-side; forget it everywhere it could be
+      // replayed: the resume point (ackedPos), the empty-delta fallback (lastPos),
+      // and any not-yet-acked batch whose `pos` belongs to the pre-reset stream.
+      this.ackedPos = undefined;
+      this.lastPos = undefined;
+      if (this.pendingAck) this.discardPendingAckPos();
+    }
+    if (dropToDevice) {
+      this.ackedToDevicePos = undefined;
+      if (this.pendingAck) this.pendingAck.toDevicePos = undefined;
+    }
+    // Rewrite durable storage to exactly the surviving cursor(s), atomically — or
+    // remove the file when nothing survives (PROTOCOL D.2: discard immediately so
+    // a later reconnect cannot replay an expired cursor).
+    this.persistAckedCursors(this.ackedPos, this.ackedToDevicePos);
+  }
+
+  /**
+   * A `sync_reset` dropped the room `pos`, but a batch may already be staged for
+   * ack carrying the now-invalid pre-reset `pos`. Drop that stale room cursor from
+   * the pending ack so we never ack it against the freshly re-initialised stream,
+   * while preserving the batch's to-device cursor/keys (unaffected by the reset).
+   */
+  private discardPendingAckPos(): void {
+    const pending = this.pendingAck;
+    if (!pending) return;
+    if (pending.toDevicePos === undefined && !pending.hadKeys) {
+      // Nothing to ack once the room pos is gone — drop the batch entirely.
+      this.pendingAck = undefined;
+      return;
+    }
+    // Keep the to-device side so its keys still get flushed + acked normally; the
+    // ack will carry only the to-device cursor (omitting the dropped room pos).
+    pending.pos = undefined;
   }
 
   private nextSyncFrame(
@@ -502,6 +581,16 @@ export class GatewayTransport {
       // Carry the last durable to-device cursor forward when this frame had no
       // to-device section, so every ack reports the latest one we hold (D.2).
       const toDevicePos = pending.toDevicePos ?? this.ackedToDevicePos;
+      // A `sync_reset` can clear the room cursor for an in-flight batch (D.2
+      // cursor expiry); the batch then carries only the to-device cursor.
+      // `sync_ack.pos` is required by the gateway, so we don't ack a missing room
+      // cursor — we still durably commit any to-device cursor (its keys were
+      // flushed above) so the gateway's separate to-device cursor stays threaded,
+      // and the next real `sync` frame's `pos` resumes the normal ack flow.
+      if (pending.pos === undefined) {
+        this.persistAckedCursors(undefined, toDevicePos);
+        return;
+      }
       this.persistAckedCursors(pending.pos, toDevicePos);
       const ack: Record<string, unknown> = { t: "sync_ack", pos: pending.pos };
       // Omit to_device_pos only if we've never received one — absent leaves the
@@ -543,14 +632,25 @@ export class GatewayTransport {
    * Persist both cursors as one atomic write (temp file + rename) so a crash
    * mid-write can never leave a half-written/corrupt cursor file (PROTOCOL D.2:
    * "durably AND atomically"). The two cursors always land together.
+   *
+   * `pos` is `undefined` only after a `sync_reset` discarded the room cursor (D.2
+   * cursor expiry): the file is then rewritten to just the surviving to-device
+   * cursor, or removed entirely if no cursor survives — so a later reconnect can
+   * never replay an expired `pos`.
    */
-  private persistAckedCursors(pos: string, toDevicePos: string | undefined): void {
+  private persistAckedCursors(pos: string | undefined, toDevicePos: string | undefined): void {
     this.ackedPos = pos;
     this.ackedToDevicePos = toDevicePos;
     if (!this.posFilePath) return;
     try {
+      if (pos === undefined && toDevicePos === undefined) {
+        rmSync(this.posFilePath, { force: true });
+        return;
+      }
       mkdirSync(path.dirname(this.posFilePath), { recursive: true });
-      const payload = toDevicePos !== undefined ? { pos, to_device_pos: toDevicePos } : { pos };
+      const payload: Record<string, string> = {};
+      if (pos !== undefined) payload.pos = pos;
+      if (toDevicePos !== undefined) payload.to_device_pos = toDevicePos;
       const tmp = `${this.posFilePath}.tmp`;
       writeFileSync(tmp, JSON.stringify(payload), "utf8");
       renameSync(tmp, this.posFilePath);

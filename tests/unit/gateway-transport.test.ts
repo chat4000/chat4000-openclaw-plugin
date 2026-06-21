@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { GatewayTransport, gatewayToBaseUrl } from "../../src/matrix/gateway-transport.js";
@@ -462,6 +462,198 @@ describe("GatewayTransport", () => {
     const start = ws2.frames().find((f) => f.t === "sync_start");
     expect(start).toMatchObject({ pos: "r1", to_device_pos: "t1" });
     transport.dispose();
+  });
+
+  it("sync_reset(pos_expired) discards the room pos but KEEPS to_device_pos (PROTOCOL D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const flush = vi.fn(() => Promise.resolve(undefined));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-reset-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      // Start with BOTH cursors durably persisted from a prior session.
+      writeFileSync(posFile, JSON.stringify({ pos: "r9", to_device_pos: "t9" }), "utf8");
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        flushBeforeAck: flush,
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync_reset", reason: "pos_expired", cursors: ["pos"] }),
+      });
+
+      // Durable file now holds ONLY the surviving to-device cursor.
+      expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({ to_device_pos: "t9" });
+      // Crypto state untouched, and we did NOT send a new sync_start.
+      expect(flush).not.toHaveBeenCalled();
+      expect(ws.frames().some((f) => f.t === "sync_start")).toBe(false);
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("after sync_reset, sync_start resumes WITHOUT the expired pos but with to_device_pos (D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-reset-rs-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      writeFileSync(posFile, JSON.stringify({ pos: "r9", to_device_pos: "t9" }), "utf8");
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync_reset", reason: "pos_expired", cursors: ["pos"] }),
+      });
+
+      // The SDK's first sync request after the reset must NOT replay the stale pos.
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+      const start = ws.frames().find((f) => f.t === "sync_start");
+      expect(start).toBeTruthy();
+      expect(defined(start).pos).toBeUndefined();
+      expect(defined(start).to_device_pos).toBe("t9");
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps consuming fresh sync frames after a reset and persists the new pos via the ack flow (D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-reset-cont-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      writeFileSync(posFile, JSON.stringify({ pos: "r9", to_device_pos: "t9" }), "utf8");
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync_reset", reason: "pos_expired", cursors: ["pos"] }),
+      });
+
+      // A fresh sync frame from the re-initialised upstream is consumed normally.
+      const p1 = transport.slidingSyncRequest({ lists: {} });
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync", pos: "fresh1", lists: {}, rooms: {}, extensions: {} }),
+      });
+      const resp = await p1;
+      expect(resp.pos).toBe("fresh1");
+
+      // Its ack persists the new room pos alongside the preserved to-device cursor.
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+      const ack = ws.frames().find((f) => f.t === "sync_ack");
+      expect(ack).toMatchObject({ pos: "fresh1", to_device_pos: "t9" });
+      expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({
+        pos: "fresh1",
+        to_device_pos: "t9",
+      });
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sync_reset removes the cursor file when no cursor survives (no to_device_pos yet)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-reset-rm-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      writeFileSync(posFile, JSON.stringify({ pos: "r9" }), "utf8");
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync_reset", reason: "pos_expired", cursors: ["pos"] }),
+      });
+
+      expect(existsSync(posFile)).toBe(false);
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("sync_reset drops a not-yet-acked pre-reset pos instead of acking it (D.2)", async () => {
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+    const flush = vi.fn(() => Promise.resolve(undefined));
+    const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-reset-pend-"));
+    const posFile = path.join(dir, "pos.json");
+    try {
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        flushBeforeAck: flush,
+        posFilePath: posFile,
+      });
+      const connectP = transport.connect();
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+
+      // A keyless frame is delivered to the SDK but not yet acked.
+      const p1 = transport.slidingSyncRequest({ lists: {} });
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync", pos: "stale", lists: {}, rooms: {}, extensions: {} }),
+      });
+      await p1;
+
+      // The room cursor expires before that batch could be acked.
+      ws.emit("message", {
+        data: JSON.stringify({ t: "sync_reset", reason: "pos_expired", cursors: ["pos"] }),
+      });
+
+      // The SDK asking again would normally ack "stale"; the reset must have
+      // dropped it, so no sync_ack carrying the expired pos is ever sent.
+      void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(ws.frames().some((f) => f.t === "sync_ack" && f.pos === "stale")).toBe(false);
+      transport.dispose();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("injects chat4000.push into an encrypted send keyed by txnId (PROTOCOL E)", async () => {
