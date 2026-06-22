@@ -327,7 +327,7 @@ describe("GatewayTransport", () => {
     transport.dispose();
   });
 
-  it("carries the last to_device_pos forward on a frame with no to-device section (D.2)", async () => {
+  it("omits to_device_pos from the ack of a frame with no to-device section, but carries it forward in the DURABLE cursor (PROTOCOL D.1 echo-exact)", async () => {
     (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
     const flush = vi.fn(() => Promise.resolve(undefined));
     const dir = mkdtempSync(path.join(os.tmpdir(), "c4k-cf-"));
@@ -368,12 +368,20 @@ describe("GatewayTransport", () => {
       });
       await p2;
 
-      // A third request acks frame 2 → to_device_pos carried forward as t1.
+      // A third request acks frame 2. The ECHO-EXACT contract (D.1): the ack
+      // must echo frame 2's to_device_pos EXACTLY — and frame 2 had NO to-device
+      // section, so the ack OMITS to_device_pos entirely (a carried-forward value
+      // here would fail the gateway's echo check → `bad_sync_ack`). The DURABLE
+      // cursor, however, still carries t1 forward — that is the reconnect-resume
+      // value, and the room cursor advances to r2.
       void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
       await new Promise((r) => setTimeout(r, 0));
 
       const acks = ws.frames().filter((f) => f.t === "sync_ack");
-      expect(acks.at(-1)).toMatchObject({ pos: "r2", to_device_pos: "t1" });
+      const lastAck = acks.at(-1);
+      expect(lastAck).toMatchObject({ pos: "r2" });
+      expect(lastAck).not.toHaveProperty("to_device_pos");
+      // Durable cursor carries t1 forward (resume point), room cursor at r2.
       expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({
         pos: "r2",
         to_device_pos: "t1",
@@ -568,11 +576,15 @@ describe("GatewayTransport", () => {
       const resp = await p1;
       expect(resp.pos).toBe("fresh1");
 
-      // Its ack persists the new room pos alongside the preserved to-device cursor.
+      // Its ack persists the new room pos. The fresh frame had NO to-device
+      // section, so the ack OMITS to_device_pos (ECHO-EXACT, D.1) — but the
+      // DURABLE cursor still preserves t9 (it survived the pos-only reset and is
+      // carried forward as the reconnect-resume value).
       void transport.slidingSyncRequest({ lists: {} }).catch(() => undefined);
       await new Promise((r) => setTimeout(r, 0));
       const ack = ws.frames().find((f) => f.t === "sync_ack");
-      expect(ack).toMatchObject({ pos: "fresh1", to_device_pos: "t9" });
+      expect(ack).toMatchObject({ pos: "fresh1" });
+      expect(ack).not.toHaveProperty("to_device_pos");
       expect(JSON.parse(readFileSync(posFile, "utf8")) as unknown).toEqual({
         pos: "fresh1",
         to_device_pos: "t9",

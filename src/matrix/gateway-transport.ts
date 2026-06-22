@@ -555,9 +555,10 @@ export class GatewayTransport {
   private markPending(resp: MSC3575SlidingSyncResponse): void {
     if (typeof resp.pos !== "string") return;
     // `to_device_pos` is present only when THIS batch advanced the to-device
-    // cursor (the gateway lifts it from extensions.to_device.next_batch). When
-    // absent we carry the last acked value forward at ack time, never derive it
-    // from `pos` (PROTOCOL D.2).
+    // cursor (the gateway lifts it from extensions.to_device.next_batch). The ack
+    // echoes this value EXACTLY (present iff the frame carried one); the DURABLE
+    // cursor carries the last value forward across frames with none. Neither is
+    // ever derived from `pos` (PROTOCOL D.1).
     this.pendingAck = {
       pos: resp.pos,
       toDevicePos: readToDevicePos(resp),
@@ -578,9 +579,22 @@ export class GatewayTransport {
     this.pendingAck = undefined;
     try {
       if (pending.hadKeys && this.flushBeforeAck) await this.flushBeforeAck();
-      // Carry the last durable to-device cursor forward when this frame had no
-      // to-device section, so every ack reports the latest one we hold (D.2).
-      const toDevicePos = pending.toDevicePos ?? this.ackedToDevicePos;
+      // Two DISTINCT to-device values, do not conflate them (PROTOCOL D.1):
+      //
+      //   • DURABLE cursor — carry the last value forward when this frame had no
+      //     to-device section, so the cursor we persist and resend in `sync_start`
+      //     on reconnect (carry-forward of the durable cursor is a RESUME concern)
+      //     keeps the latest value we hold instead of regressing to undefined.
+      //
+      //   • ACK echo — the gateway now requires `sync_ack.to_device_pos` to ECHO
+      //     EXACTLY the `to_device_pos` of the `sync` frame being acked: present
+      //     IFF that frame carried a to-device section, omitted otherwise, and
+      //     NEVER a carried-forward earlier value. The gateway validates the echo
+      //     against the cursor it last sent and closes the socket with
+      //     `bad_sync_ack` on any mismatch, so the ack must use `pending.toDevicePos`
+      //     verbatim — not the durable carry-forward value.
+      const durableToDevicePos = pending.toDevicePos ?? this.ackedToDevicePos;
+      const ackToDevicePos = pending.toDevicePos;
       // A `sync_reset` can clear the room cursor for an in-flight batch (D.2
       // cursor expiry); the batch then carries only the to-device cursor.
       // `sync_ack.pos` is required by the gateway, so we don't ack a missing room
@@ -588,14 +602,16 @@ export class GatewayTransport {
       // flushed above) so the gateway's separate to-device cursor stays threaded,
       // and the next real `sync` frame's `pos` resumes the normal ack flow.
       if (pending.pos === undefined) {
-        this.persistAckedCursors(undefined, toDevicePos);
+        this.persistAckedCursors(undefined, durableToDevicePos);
         return;
       }
-      this.persistAckedCursors(pending.pos, toDevicePos);
+      this.persistAckedCursors(pending.pos, durableToDevicePos);
       const ack: Record<string, unknown> = { t: "sync_ack", pos: pending.pos };
-      // Omit to_device_pos only if we've never received one — absent leaves the
-      // gateway's to-device cursor unchanged.
-      if (toDevicePos !== undefined) ack.to_device_pos = toDevicePos;
+      // Echo the acked frame's to-device cursor EXACTLY — present iff that frame
+      // carried one, omitted otherwise. Absent leaves the gateway's to-device
+      // cursor unchanged; a carried-forward value here would fail the gateway's
+      // echo check (`bad_sync_ack`).
+      if (ackToDevicePos !== undefined) ack.to_device_pos = ackToDevicePos;
       this.safeSend(ack);
     } catch (err) {
       this.pendingAck = pending; // not persisted → retry on the next request
