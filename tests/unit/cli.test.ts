@@ -278,6 +278,65 @@ describe("chat4000 CLI error/exit-code boundary", () => {
     expect(process.exitCode).not.toBe(1);
   });
 
+  it("pair --code mints the caller-supplied code verbatim", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    configureEnvIdentity();
+    let registerBody: Record<string, unknown> | undefined;
+    let statusAttempts = 0;
+    const fetchMock = vi.fn(
+      (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = urlOf(input);
+        if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
+        if (url.endsWith("/codes")) {
+          registerBody = JSON.parse(bodyText(init?.body)) as Record<string, unknown>;
+          return jsonResponse(200, { ok: true, expires_at: Date.now() + 300_000 });
+        }
+        if (url.includes("/codes/")) {
+          statusAttempts += 1;
+          return jsonResponse(200, {
+            status: "completed",
+            user_id: "@u_x:chat4000.com",
+            redeems: [{ device_id: "DEV1", client_id: "phone-1", redeemed_at: Date.now() }],
+            redeemed_count: 1,
+          });
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const actions = captureCliActions();
+    const pair = actions.get("chat4000 pair");
+    expect(pair).toBeDefined();
+    const run = pair?.({ ttl: "300", code: "424242" });
+    for (let i = 0; i < 120 && statusAttempts < 1; i += 1) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    await run;
+    expect(registerBody).toMatchObject({ code: "424242" });
+    expect(process.exitCode).not.toBe(1);
+  });
+
+  it("pair --code rejects a non-6-digit code before minting (exitCode 1)", async () => {
+    configureEnvIdentity();
+    const fetchMock = vi.fn((input: string | URL | Request): Promise<Response> => {
+      const url = urlOf(input);
+      if (url.includes("/version")) return jsonResponse(200, { action: "ok" });
+      // The validation must fire before any mint — a /codes hit here is the bug.
+      if (url.includes("/codes")) return Promise.reject(new Error(`should not mint: ${url}`));
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const actions = captureCliActions();
+    const pair = actions.get("chat4000 pair");
+    expect(pair).toBeDefined();
+    await pair?.({ ttl: "300", code: "12345" });
+    expect(writtenOutput()).toContain("must be exactly 6 digits");
+    expect(process.exitCode).toBe(1);
+  });
+
   // PROTOCOL C.6: setup = birth bot (POST /plugins, service token) → PUT /user
   // (bot token) → rooms + invites, all BEFORE any device pairs. Idempotent: a
   // re-run reuses the same derived user/rooms.

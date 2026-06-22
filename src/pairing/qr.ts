@@ -31,8 +31,14 @@ export async function startHumanPairing(params: {
   ttlSeconds?: number;
   /** PROTOCOL C.3.1: redeemable many times until expiry (fleet enrollment). */
   reusable?: boolean;
+  /**
+   * Caller-chosen code (must be exactly 6 digits — validated at the CLI
+   * boundary). Random when omitted. The registrar still enforces the format and
+   * rejects a collision with `M_CODE_IN_USE`.
+   */
+  code?: string | undefined;
 }): Promise<StartHumanPairingResult> {
-  const code = generatePairingCode();
+  const code = params.code ?? generatePairingCode();
   const result = await params.registrar.mintCode({
     code,
     ttlSeconds: params.ttlSeconds,

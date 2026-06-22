@@ -102,6 +102,7 @@ type PairCommandOptions = {
   serviceToken?: string;
   ttl?: string;
   reusable?: boolean | undefined;
+  code?: string | undefined;
 };
 
 type WizardCommandOptions = {
@@ -184,6 +185,10 @@ export function registerChat4000Cli(api: PluginApiLike): void {
         .option(
           "--reusable",
           "Code can be redeemed many times until expiry, each redeem adding a device",
+        )
+        .option(
+          "--code <code>",
+          "Use this exact code instead of a random one (must be exactly 6 digits)",
         )
         .action(async (opts: PairCommandOptions) => {
           await runPair(api, opts).catch(handleCliError);
@@ -624,6 +629,12 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
     Math.min(PAIR_CODE_TTL_MAX_SECONDS, Number.parseInt(opts.ttl ?? "300", 10) || 300),
   );
   const reusable = opts.reusable === true;
+  // A caller-supplied `--code` is validated here (fast, local) before any
+  // network call; the registrar still owns format + collision (M_CODE_IN_USE).
+  const customCode = opts.code;
+  if (customCode !== undefined && !/^\d{6}$/.test(customCode)) {
+    throw new Error("--code must be exactly 6 digits");
+  }
 
   let pairing;
   try {
@@ -631,6 +642,7 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
       registrar: client,
       ttlSeconds,
       reusable,
+      code: customCode,
     });
   } catch (err) {
     if (err instanceof RegistrarError && err.status === 409 && err.errcode === "M_NO_USER") {
