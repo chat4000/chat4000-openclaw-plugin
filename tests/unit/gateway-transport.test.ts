@@ -668,6 +668,100 @@ describe("GatewayTransport", () => {
     }
   });
 
+  it("rejects connect() when no auth_ok arrives within authTimeoutMs (fail-fast, not hang)", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        authTimeoutMs: 5_000,
+      });
+      const connectP = transport.connect().catch((e: Error) => e);
+      const ws = FakeWebSocket.instances[0];
+      // The gateway accepts the socket and we send `auth`, but it never replies
+      // `auth_ok` and never closes — the exact non-authing-gateway hang.
+      ws.emit("open", {});
+      expect(ws.frames()[0]).toMatchObject({ t: "auth" });
+
+      // Just before the budget: still pending (no early reject).
+      vi.advanceTimersByTime(4_999);
+      // Cross the budget: connect() must reject with the message-bearing error.
+      vi.advanceTimersByTime(1);
+      const err = await connectP;
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toBe(
+        "gateway auth handshake timed out after 5000ms (wss://gateway.chat4000.com/ws)",
+      );
+      transport.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves connect() normally when auth_ok arrives within the budget", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        authTimeoutMs: 5_000,
+      });
+      let resolved = false;
+      const connectP = transport.connect().then(() => {
+        resolved = true;
+      });
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      vi.advanceTimersByTime(1_000); // within budget
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+      expect(resolved).toBe(true);
+      transport.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the auth timer on auth_ok — no late timeout reject and no double-settle", async () => {
+    vi.useFakeTimers();
+    try {
+      (globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket;
+      const transport = new GatewayTransport({
+        gatewayUrl: "wss://gateway.chat4000.com/ws",
+        accessToken: "syt",
+        authTimeoutMs: 5_000,
+      });
+      const outcomes: string[] = [];
+      const connectP = transport.connect().then(
+        () => outcomes.push("resolved"),
+        () => outcomes.push("rejected"),
+      );
+      const ws = FakeWebSocket.instances[0];
+      ws.emit("open", {});
+      ws.emit("message", {
+        data: JSON.stringify({ t: "auth_ok", user_id: "@p:hs", device_id: "D" }),
+      });
+      await connectP;
+      expect(outcomes).toEqual(["resolved"]);
+
+      // The timer must have been cleared on auth_ok: advancing well past the
+      // budget fires NOTHING. A leaked timer would call settleAuthReject — but the
+      // promise already settled, so a second settle could never flip the outcome
+      // (and `vi.getTimerCount()` proves no timer is left armed at all).
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      expect(outcomes).toEqual(["resolved"]); // still exactly one outcome
+      transport.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("injects chat4000.push into an encrypted send keyed by txnId (PROTOCOL E)", async () => {
     _resetPushRegistry();
     const { transport, ws } = await connected();

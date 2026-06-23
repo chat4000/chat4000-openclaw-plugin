@@ -68,6 +68,13 @@ export type GatewayTransportOptions = {
   log?: Logger | undefined;
   /** Per-`req` response timeout. */
   requestTimeoutMs?: number;
+  /**
+   * How long to wait for `auth_ok` after the socket opens and we send the `auth`
+   * frame, before failing the handshake. Guards against a gateway that accepts
+   * the socket but never replies `auth_ok` and never closes — without this,
+   * `connect()` hangs forever (no error, no reconnect).
+   */
+  authTimeoutMs?: number;
   /** How long a sync wait blocks before returning an empty delta (long-poll-ish). */
   syncTimeoutMs?: number;
   /** Reconnect backoff ceiling. */
@@ -127,11 +134,28 @@ export class GatewayTransport {
 
   private readonly requestTimeoutMs: number;
 
+  private readonly authTimeoutMs: number;
+
   private readonly syncTimeoutMs: number;
 
   private readonly maxBackoffMs: number;
 
   private ws: WebSocket | undefined;
+
+  /**
+   * The listeners we attached to `this.ws`, kept so we can detach them before
+   * dropping a socket. Detaching is what guarantees a replaced socket can neither
+   * fire callbacks (it would otherwise re-enter `onClose` → schedule a SECOND
+   * reconnect, the close→reopen loop) nor keep the connection referenced.
+   */
+  private wsListeners:
+    | {
+        open: () => void;
+        message: (ev: MessageEvent) => void;
+        close: () => void;
+        error: () => void;
+      }
+    | undefined;
 
   private connected = false;
 
@@ -181,6 +205,13 @@ export class GatewayTransport {
   /** Resolver for the in-progress (re)connect's auth handshake. */
   private authSettle: { resolve: () => void; reject: (e: Error) => void } | undefined;
 
+  /**
+   * Bounds the `auth` → `auth_ok` handshake. Armed when the socket is created,
+   * cleared on EVERY auth outcome (auth_ok / auth_error / close / its own fire),
+   * so it neither leaks nor lets the promise settle twice.
+   */
+  private authTimer: ReturnType<typeof setTimeout> | undefined;
+
   constructor(opts: GatewayTransportOptions) {
     this.gatewayUrl = opts.gatewayUrl;
     this.accessToken = opts.accessToken;
@@ -189,6 +220,7 @@ export class GatewayTransport {
     this.flushBeforeAck = opts.flushBeforeAck;
     this.log = opts.log;
     this.requestTimeoutMs = opts.requestTimeoutMs ?? 30_000;
+    this.authTimeoutMs = opts.authTimeoutMs ?? 20_000;
     this.syncTimeoutMs = opts.syncTimeoutMs ?? 30_000;
     this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
     const persisted = this.loadPersistedCursors();
@@ -266,14 +298,13 @@ export class GatewayTransport {
   dispose(): void {
     this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = undefined;
+    }
     this.failInFlight(new Error("gateway transport disposed"));
     this.syncStarted = false;
-    try {
-      this.ws?.close();
-    } catch {
-      // ignore
-    }
-    this.ws = undefined;
+    this.teardownSocket();
     this.connected = false;
   }
 
@@ -281,30 +312,117 @@ export class GatewayTransport {
 
   private openSocket(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      // Guarantee exactly ONE live socket per transport: tear down any previous
+      // socket (detach listeners + close) BEFORE creating the next one. Without
+      // this, a reconnect storm piled up sockets — each with dangling listeners,
+      // each holding a connection — exhausting the gateway's per-IP limit. The
+      // teardown detaches the old `close` handler FIRST, so closing it cannot
+      // re-enter `onClose` and schedule another reconnect (the close→reopen loop).
+      this.teardownSocket();
+
       this.authSettle = { resolve, reject };
       let ws: WebSocket;
       try {
         ws = new WebSocket(this.gatewayUrl);
       } catch (err) {
-        this.authSettle = undefined;
-        reject(err instanceof Error ? err : new Error(String(err)));
+        this.settleAuthReject(err instanceof Error ? err : new Error(String(err)));
         return;
       }
       this.ws = ws;
-      ws.addEventListener("open", () => {
-        this.safeSend(this.authFrame());
-      });
-      ws.addEventListener("message", (ev: MessageEvent) => {
-        this.onMessage(ev.data);
-      });
-      ws.addEventListener("close", () => {
-        this.onClose();
-      });
-      ws.addEventListener("error", () => {
-        // A failed connection always also emits `close`; reconnect is handled there.
-        this.log?.debug?.("gateway socket error");
-      });
+      // Bound the handshake: if no `auth_ok` arrives in time, fail fast instead of
+      // hanging forever. The teardown detaches listeners FIRST, so closing the
+      // half-open socket here can't re-enter `onClose` → no reconnect storm; the
+      // rejection surfaces to connect()'s caller (e.g. `openclaw chat4000 setup`).
+      this.authTimer = setTimeout(() => {
+        this.teardownSocket();
+        this.settleAuthReject(
+          new Error(
+            `gateway auth handshake timed out after ${this.authTimeoutMs}ms (${this.gatewayUrl})`,
+          ),
+        );
+      }, this.authTimeoutMs);
+      const listeners = {
+        open: (): void => {
+          this.safeSend(this.authFrame());
+        },
+        message: (ev: MessageEvent): void => {
+          this.onMessage(ev.data);
+        },
+        close: (): void => {
+          this.onClose();
+        },
+        error: (): void => {
+          // A failed connection always also emits `close`; reconnect is handled there.
+          this.log?.debug?.("gateway socket error");
+        },
+      };
+      this.wsListeners = listeners;
+      ws.addEventListener("open", listeners.open);
+      ws.addEventListener("message", listeners.message);
+      ws.addEventListener("close", listeners.close);
+      ws.addEventListener("error", listeners.error);
     });
+  }
+
+  /**
+   * Settle the in-progress handshake exactly once: clear the auth timer and the
+   * `authSettle` slot BEFORE resolving/rejecting, so neither the timer nor a later
+   * auth frame (auth_ok/auth_error/close) can settle the same promise twice.
+   */
+  private settleAuthResolve(): void {
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = undefined;
+    }
+    const settle = this.authSettle;
+    this.authSettle = undefined;
+    settle?.resolve();
+  }
+
+  private settleAuthReject(err: Error): void {
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = undefined;
+    }
+    const settle = this.authSettle;
+    this.authSettle = undefined;
+    settle?.reject(err);
+  }
+
+  /**
+   * Detach every listener from the current socket and close it, leaving the
+   * transport with no live socket. Detaching the `close`/`error` handlers BEFORE
+   * `close()` is what prevents the dropped socket from re-entering `onClose` (and
+   * scheduling a spurious reconnect). Idempotent: a no-op when there is no socket.
+   */
+  private teardownSocket(): void {
+    // The handshake belongs to the socket we're dropping; cancel its bound so a
+    // stale timer can't fire against a replacement socket's authSettle (a leaked
+    // timer + cross-socket settle). openSocket arms a fresh one for the new socket.
+    if (this.authTimer) {
+      clearTimeout(this.authTimer);
+      this.authTimer = undefined;
+    }
+    const ws = this.ws;
+    const listeners = this.wsListeners;
+    this.ws = undefined;
+    this.wsListeners = undefined;
+    if (!ws) return;
+    if (listeners) {
+      try {
+        ws.removeEventListener("open", listeners.open);
+        ws.removeEventListener("message", listeners.message);
+        ws.removeEventListener("close", listeners.close);
+        ws.removeEventListener("error", listeners.error);
+      } catch (err) {
+        this.log?.warn?.(`gateway socket listener detach failed: ${String(err)}`);
+      }
+    }
+    try {
+      ws.close();
+    } catch (err) {
+      this.log?.warn?.(`gateway socket close failed: ${String(err)}`);
+    }
   }
 
   private onMessage(data: unknown): void {
@@ -321,8 +439,7 @@ export class GatewayTransport {
         this.connected = true;
         this.backoffMs = 0;
         this.log?.info?.(`gateway auth ok (${str(frame.user_id)})`);
-        this.authSettle?.resolve();
-        this.authSettle = undefined;
+        this.settleAuthResolve();
         // On a reconnect, resume the sync stream where we left off.
         if (this.syncStarted && this.lastSyncBody) {
           this.sendSyncStart(JSON.parse(this.lastSyncBody) as Record<string, unknown>);
@@ -332,8 +449,7 @@ export class GatewayTransport {
       case "auth_error": {
         const reason = str(frame.reason, "auth rejected");
         this.log?.error?.(`gateway auth error: ${reason}`);
-        this.authSettle?.reject(new Error(`gateway auth error: ${reason}`));
-        this.authSettle = undefined;
+        this.settleAuthReject(new Error(`gateway auth error: ${reason}`));
         // Token is bad; don't hammer the gateway. dispose() stops reconnects.
         this.closed = true;
         try {
