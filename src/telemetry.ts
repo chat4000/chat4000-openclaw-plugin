@@ -89,6 +89,22 @@ export function captureChat4000Exception(error: unknown, scope?: string): void {
   });
 }
 
+/**
+ * Flush Sentry's background transport so captured exceptions reach the server
+ * before a process-ending action. The plugin runs many short-lived paths
+ * (one-shot CLI commands, self-update restarts); without an explicit flush the
+ * background transport drops in-flight events on exit. Best-effort and bounded
+ * by `timeoutMs`; never throws into the caller.
+ */
+export async function flushTelemetry(timeoutMs: number = 2_000): Promise<void> {
+  if (!sentryClient) return;
+  try {
+    await sentryClient.flush(timeoutMs);
+  } catch {
+    // Flush is best-effort; a failure here must never break shutdown.
+  }
+}
+
 // ─── Error sink (Rule 6) ─────────────────────────────────────────────────────
 
 const RATE_LIMIT_MS = 3_600_000; // 1 hour per fingerprint

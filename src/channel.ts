@@ -56,8 +56,10 @@ import { getChat4000SessionBinding } from "./session-binding.js";
 import { report } from "./telemetry.js";
 import {
   emitPluginBootAnalytics,
+  flushAllTelemetry,
   machineClientId,
   registerPairedClientId,
+  registerTelemetryShutdownHooks,
   track,
 } from "./analytics.js";
 import { snapshotContainerRebuilt } from "./machine-ids.js";
@@ -212,6 +214,10 @@ export const chat4000Plugin = {
       // PL1/PL5: fleet liveness on the first account brought up this process.
       if (!pluginStartedEmitted) {
         pluginStartedEmitted = true;
+        // Flush telemetry on SIGINT/SIGTERM/normal-exit so the boot events just
+        // emitted (and any captured exception) are never dropped when the host
+        // terminates this long-running gateway process.
+        registerTelemetryShutdownHooks();
         emitPluginBootAnalytics({ containerRebuilt: snapshotContainerRebuilt() });
       }
 
@@ -434,6 +440,10 @@ export const chat4000Plugin = {
       devicePairingManagers.get(ctx.account.accountId)?.dispose();
       devicePairingManagers.delete(ctx.account.accountId);
       unregisterHandle(ctx.account.accountId);
+      // Drain any analytics emitted during this account's lifetime (e.g. the
+      // resident `pairing_completed` listener above) and any captured exception
+      // before the gateway loop unwinds — so a graceful abort loses nothing.
+      await flushAllTelemetry();
     },
   },
 

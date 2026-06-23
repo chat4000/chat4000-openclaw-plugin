@@ -21,7 +21,7 @@ import { execFile } from "node:child_process";
 import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { readPackageName } from "../package-info.js";
-import { flushAnalytics, track } from "../analytics.js";
+import { flushAllTelemetry, track } from "../analytics.js";
 import { writeUpdateMarker } from "./boot-guard.js";
 import { checkUpdatePreflight, type RestartMethod, type UpdatePreflight } from "./preflight.js";
 
@@ -200,7 +200,7 @@ export async function applyUpdate(opts: ApplyUpdateOptions = {}): Promise<ApplyU
       to_version: target,
       trigger: opts.trigger,
     });
-    await flushAnalytics();
+    await flushAllTelemetry();
   }
 
   // PROTOCOL C.5.2: install the registrar's `source` ref verbatim when given;

@@ -40,7 +40,7 @@ import {
   getTelemetryStatus,
   setTelemetryEnabled,
 } from "./telemetry.js";
-import { flushAnalytics, registerPairedClientId, track } from "./analytics.js";
+import { flushAllTelemetry, registerPairedClientId, track } from "./analytics.js";
 import { buildWizardEnvSummary, runWizard } from "./wizard.js";
 
 /**
@@ -718,7 +718,7 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
         ...(pairedClientId ? { paired_client_id: pairedClientId } : {}),
       });
     }
-    if (fresh.length > 0) await flushAnalytics();
+    if (fresh.length > 0) await flushAllTelemetry();
     if (redeems.length > 0) {
       // PROTOCOL C.3: nothing to do membership-wise — the user's invites to the
       // space + control room pre-exist from setup (C.6) and the new device

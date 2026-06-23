@@ -24,7 +24,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { readPackageVersion } from "./package-info.js";
-import { getEnvId, getTelemetryStatus, report } from "./telemetry.js";
+import { flushTelemetry, getEnvId, getTelemetryStatus, report } from "./telemetry.js";
 import { readOrMintAgentInstallId } from "./machine-ids.js";
 import { resolveChat4000PluginDir } from "./paths.js";
 
@@ -35,7 +35,8 @@ const POSTHOG_HOST = (
   process.env.CHAT4000_POSTHOG_HOST?.trim() || "https://posthog.chat4000.com"
 ).replace(/\/+$/, "");
 const POSTHOG_API_KEY =
-  process.env.CHAT4000_POSTHOG_API_KEY?.trim() || "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4";
+  process.env.CHAT4000_POSTHOG_API_KEY?.trim() ||
+  "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4";
 
 const PACKAGE_VERSION = readPackageVersion();
 const SESSION_ID = randomUUID();
@@ -77,6 +78,57 @@ export async function flushAnalytics(timeoutMs: number = CAPTURE_TIMEOUT_MS): Pr
     await Promise.race([Promise.allSettled(pending).then(() => undefined), deadline]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Flush BOTH telemetry transports before a process-ending action: PostHog
+ * (await in-flight `/capture/` POSTs) and Sentry (drain its background
+ * transport). Call this from every shutdown/exit path so no analytics or crash
+ * event is lost when the process exits, restarts, or a short-lived task ends.
+ * Best-effort and bounded; never throws.
+ */
+export async function flushAllTelemetry(timeoutMs: number = CAPTURE_TIMEOUT_MS): Promise<void> {
+  await Promise.allSettled([flushAnalytics(timeoutMs), flushTelemetry(timeoutMs)]);
+}
+
+let shutdownHooksRegistered = false;
+
+/**
+ * Register one-time process signal/exit handlers that flush both telemetry
+ * transports. Plugins run many short-lived and signal-terminated paths; without
+ * this, boot events (`plugin_started`/`container_rebuilt`) and any captured
+ * exception are dropped when the host sends SIGINT/SIGTERM or the event loop
+ * drains. Idempotent. Handlers do NOT call `process.exit()` — they only flush,
+ * leaving the host's own teardown and exit code intact.
+ */
+export function registerTelemetryShutdownHooks(): void {
+  if (shutdownHooksRegistered) return;
+  shutdownHooksRegistered = true;
+
+  let flushing: Promise<void> | undefined;
+  const flushOnce = (): Promise<void> => {
+    if (!flushing) flushing = flushAllTelemetry();
+    return flushing;
+  };
+
+  // `beforeExit` fires when the loop is about to drain on a normal exit; async
+  // work scheduled here keeps the process alive until the flush resolves.
+  process.once("beforeExit", () => {
+    void flushOnce();
+  });
+
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    // `once` auto-removes our handler after it fires, so the re-raised signal
+    // below hits whatever the host registered (or the default action) — we
+    // never clobber other listeners.
+    process.once(signal, () => {
+      void flushOnce().finally(() => {
+        // Re-raise so the host's own handler / default disposition (and exit
+        // code) is honored once telemetry has drained, rather than swallowed.
+        process.kill(process.pid, signal);
+      });
+    });
   }
 }
 
@@ -186,7 +238,11 @@ function hostAgentVersion(): string {
           name?: unknown;
           version?: unknown;
         };
-        if (manifest.name === "openclaw" && typeof manifest.version === "string" && manifest.version)
+        if (
+          manifest.name === "openclaw" &&
+          typeof manifest.version === "string" &&
+          manifest.version
+        )
           return manifest.version;
       }
       const parent = path.dirname(dir);

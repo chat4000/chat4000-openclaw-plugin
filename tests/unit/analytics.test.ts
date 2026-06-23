@@ -19,6 +19,7 @@ async function loadModule(): Promise<Analytics> {
     getTelemetryStatus: () => ({ enabled: telemetryEnabled }),
     getEnvId: () => "env-id-123",
     report: reportSpy,
+    flushTelemetry: () => Promise.resolve(),
   }));
   vi.doMock("../../src/machine-ids.js", () => ({
     readOrMintAgentInstallId: () => "agent-id-456",
