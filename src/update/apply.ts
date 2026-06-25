@@ -69,6 +69,10 @@ function resolveOpenclawBin(): string {
   return process.env.OPENCLAW_BIN?.trim() || "openclaw";
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 async function installVersion(
   packageName: string,
   version: string,
@@ -114,6 +118,7 @@ function scheduleRestart(
   log: (l: string) => void,
 ): boolean {
   const openclaw = resolveOpenclawBin();
+  const quotedOpenclaw = shellQuote(openclaw);
   const delay = Math.max(1, delaySeconds);
   try {
     if (method === "docker") {
@@ -127,7 +132,7 @@ function scheduleRestart(
       return true;
     }
     if (method === "supervised") {
-      const child = spawn("sh", ["-c", `sleep ${delay}; ${openclaw} gateway restart`], {
+      const child = spawn("sh", ["-c", `sleep ${delay}; ${quotedOpenclaw} gateway restart`], {
         detached: true,
         stdio: "ignore",
       });
@@ -137,7 +142,7 @@ function scheduleRestart(
     }
     if (method === "foreground") {
       // We run inside the gateway; a detached helper waits, kills it, relaunches.
-      const script = `sleep ${delay}; pkill -f 'openclaw gateway run'; sleep 1; nohup ${openclaw} gateway run >/tmp/openclaw-gateway.log 2>&1 &`;
+      const script = `sleep ${delay}; pkill -f 'openclaw gateway run'; sleep 1; nohup ${quotedOpenclaw} gateway run >/tmp/openclaw-gateway.log 2>&1 &`;
       const child = spawn("sh", ["-c", script], { detached: true, stdio: "ignore" });
       child.unref();
       log(`scheduled: detached relaunch of 'openclaw gateway run' (in ${delay}s)`);
