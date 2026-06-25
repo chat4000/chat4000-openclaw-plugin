@@ -416,7 +416,7 @@ def detect_openclaw() -> Optional[tuple[str, str]]:
         version = "unknown"
     return (path, version)
 
-def detect_restart_method() -> Optional[str]:
+def detect_restart_method(openclaw: str) -> Optional[str]:
     """Return one of:
       - 'docker'              (openclaw-gateway container running)
       - 'openclaw-supervised' (openclaw service is managed by launchd/systemd/schtasks)
@@ -437,7 +437,6 @@ def detect_restart_method() -> Optional[str]:
             pass
     # Probe `openclaw gateway status` — if it reports a managed service,
     # use `openclaw gateway restart`. Otherwise fall back to foreground.
-    openclaw = shutil.which("openclaw") or "openclaw"
     try:
         r = subprocess.run(
             [openclaw, "gateway", "status"],
@@ -524,10 +523,8 @@ def install_plugin(openclaw: str, force: bool, spec: Optional[str] = None) -> tu
         # we fall out with the most recent tail.
     return False, _scrub_secrets(last_tail) if last_tail else ""
 
-def restart_gateway(method: str) -> bool:
+def restart_gateway(method: str, openclaw: str) -> bool:
     """Returns True if a restart was actually issued."""
-    openclaw = shutil.which("openclaw") or "openclaw"
-
     if method == "docker":
         docker = shutil.which("docker")
         if not docker:
@@ -550,7 +547,7 @@ def restart_gateway(method: str) -> bool:
         # the actual "disabled" message and fall through to foreground.
         if "service disabled" in out.lower():
             warn("Gateway service is not installed under a supervisor — starting in foreground.")
-            return restart_gateway("foreground")
+            return restart_gateway("foreground", openclaw)
         if r.returncode == 0:
             return True
         if out.strip():
@@ -607,8 +604,23 @@ def verify_plugin_registered(openclaw: str) -> bool:
     except Exception:
         return False
 
+def openclaw_state_root() -> Path:
+    """Mirror OpenClaw's state-dir env resolution for installer-side file access."""
+    explicit = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = os.environ.get("OPENCLAW_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "state"
+    return Path.home() / ".openclaw"
+
+
+def chat4000_state_dir() -> Path:
+    return openclaw_state_root() / "plugins" / "chat4000"
+
+
 def reset_local_state() -> None:
-    state_dir = Path.home() / ".openclaw" / "plugins" / "chat4000"
+    state_dir = chat4000_state_dir()
     if state_dir.exists():
         warn(f"Removing {state_dir} (key + ack store) — already-paired devices will fail to decrypt until re-paired.")
         ans = input(f"{C_YEL}Continue? [y/N]:{C_RST} ").strip().lower()
@@ -866,8 +878,14 @@ def main() -> int:
         return 0
 
     hdr("🔁 Starting OpenClaw gateway")
-    method = detect_restart_method()
-    if method is not None and restart_gateway(method):
+    runtime_log = chat4000_state_dir() / "logs" / "runtime.log"
+    try:
+        runtime_log_start_offset = runtime_log.stat().st_size
+    except OSError:
+        runtime_log_start_offset = 0
+    method = detect_restart_method(openclaw_path)
+    gateway_started_at = time.time()
+    if method is not None and restart_gateway(method, openclaw_path):
         ok(f"Gateway started (method: {method}).")
         _emit("installer_gateway_restarted", {"method": method})
     else:
@@ -891,13 +909,17 @@ def main() -> int:
     print(f"{C_DIM}This can take a couple of minutes on first install while OpenClaw{C_RST}")
     print(f"{C_DIM}loads plugins and the chat4000 channel connects through the gateway.{C_RST}")
     print(f"{C_DIM}Grab a coffee — we'll let you know the moment it's ready.{C_RST}")
-    if wait_for_chat4000_connected(timeout=120):
+    if wait_for_chat4000_connected(
+        started_at=gateway_started_at,
+        start_offset=runtime_log_start_offset,
+        timeout=120,
+    ):
         ok("chat4000 connected. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
         _emit("installer_succeeded", {})
         _emit("installer_chat4000_relay_connected", {})
         return 0
     warn("chat4000 didn't connect within 120s.")
-    warn(f"Watch logs: {C_CYN}tail -f /root/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
+    warn(f"Watch logs: {C_CYN}tail -f {chat4000_state_dir() / 'logs' / 'runtime.log'}{C_RST}")
     warn(f"            {C_CYN}tail -f /tmp/openclaw-gateway.log{C_RST}")
     _emit("installer_failed", {
         "stage": "relay_handshake",
@@ -913,13 +935,31 @@ def main() -> int:
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 
-def wait_for_chat4000_connected(timeout: float = 120.0) -> bool:
+def log_has_fresh_hello(log_path: Path, started_at: float, start_offset: int) -> bool:
+    try:
+        stat = log_path.stat()
+        if stat.st_mtime < started_at:
+            return False
+        offset = start_offset if stat.st_size >= start_offset else 0
+        with log_path.open("rb") as handle:
+            handle.seek(offset)
+            content = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return False
+    return "runtime.hello_ok" in content
+
+
+def wait_for_chat4000_connected(
+    started_at: float,
+    start_offset: int,
+    timeout: float = 120.0,
+) -> bool:
     """Poll the chat4000 runtime.log for `runtime.hello_ok` (which
     indicates a successful relay handshake). Show a spinner with status
     text. Returns True if connected within `timeout` seconds."""
     import time as _time
 
-    runtime_log = Path.home() / ".openclaw" / "plugins" / "chat4000" / "logs" / "runtime.log"
+    runtime_log = chat4000_state_dir() / "logs" / "runtime.log"
     gateway_log = Path("/tmp/openclaw-gateway.log")
     deadline = _time.time() + timeout
     started = _time.time()
@@ -931,16 +971,11 @@ def wait_for_chat4000_connected(timeout: float = 120.0) -> bool:
 
     while _time.time() < deadline:
         # Check chat4000 runtime log for relay handshake.
-        if runtime_log.exists():
-            try:
-                content = runtime_log.read_text(errors="ignore")
-                if "runtime.hello_ok" in content:
-                    if is_tty:
-                        sys.stdout.write("\r" + " " * 100 + "\r")
-                        sys.stdout.flush()
-                    return True
-            except Exception:
-                pass
+        if log_has_fresh_hello(runtime_log, started_at, start_offset):
+            if is_tty:
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                sys.stdout.flush()
+            return True
 
         # Render spinner — derive a coarse status from what we can see
         # so far so the user knows WHAT we're waiting on.
