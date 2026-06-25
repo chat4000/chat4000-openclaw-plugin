@@ -7,7 +7,7 @@
  * surfaces decrypted room messages + connection state to the channel layer.
  *
  * The plugin uses the Matrix client-server API directly against the homeserver;
- * the WS Gateway (PROTOCOL §4) is for end-user devices, not required here.
+ * the WS Gateway (PROTOCOL section 4) is for end-user devices, not required here.
  *
  * Reference: /tmp/openclaw/extensions/matrix/src/matrix/{client,sdk}.ts.
  */
@@ -51,6 +51,8 @@ import {
 } from "./inbound.js";
 import type { MatrixConnectionState, MatrixCredentials, MatrixInboundMessage } from "./types.js";
 
+const INITIAL_SYNC_TIMEOUT_MS = 60_000;
+
 /** Read the `kind` field off a `chat4000.room_kind` state-event content. */
 function readRoomKind(content: unknown): string | undefined {
   if (content && typeof content === "object") {
@@ -69,7 +71,7 @@ export type MatrixClientHandleOptions = {
   abortSignal?: AbortSignal | undefined;
   onConnectionState?: ((state: MatrixConnectionState) => void) | undefined;
   onMessage?: ((message: MatrixInboundMessage) => void) | undefined;
-  /** chat4000.command control events (PROTOCOL §5). */
+  /** chat4000.command control events (PROTOCOL section 5). */
   onCommand?: ((command: MatrixInboundCommand) => void) | undefined;
   log?:
     | {
@@ -388,8 +390,15 @@ export class MatrixClientHandle {
     this.opts.onConnectionState?.("connecting");
     // Sliding sync drives room/event state from the gateway's `sync` frames;
     // `initialSyncLimit` does not apply (the list's timeline_limit governs it).
-    await this.client.startClient({ slidingSync: this.slidingSync });
-    await this.waitForInitialSync();
+    try {
+      await this.client.startClient({ slidingSync: this.slidingSync });
+      await this.waitForInitialSync(INITIAL_SYNC_TIMEOUT_MS);
+    } catch (err) {
+      this.started = false;
+      this.opts.onConnectionState?.("disconnected");
+      this.client.stopClient();
+      throw err;
+    }
 
     // C2: periodically snapshot the crypto store so a restart keeps our keys.
     this.persistTimer = setInterval(() => {
@@ -408,14 +417,41 @@ export class MatrixClientHandle {
     }
   }
 
-  private waitForInitialSync(): Promise<void> {
-    return new Promise<void>((resolve) => {
+  private waitForInitialSync(timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        this.client.off(ClientEvent.Sync, onSync);
+        this.opts.abortSignal?.removeEventListener("abort", onAbort);
+        clearTimeout(timer);
+      };
+      const settle = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      };
+      const onAbort = (): void => {
+        settle(() => reject(new Error("Matrix initial sync aborted")));
+      };
       const onSync = (state: SyncState): void => {
         if (state === SyncState.Prepared || state === SyncState.Syncing) {
-          this.client.off(ClientEvent.Sync, onSync);
-          resolve();
+          settle(resolve);
+          return;
+        }
+        if (state === SyncState.Error || state === SyncState.Stopped) {
+          settle(() => reject(new Error(`Matrix initial sync failed: ${state}`)));
         }
       };
+      const timer = setTimeout(() => {
+        settle(() => reject(new Error(`Matrix initial sync timed out after ${timeoutMs}ms`)));
+      }, timeoutMs);
+      timer.unref?.();
+      if (this.opts.abortSignal?.aborted) {
+        onAbort();
+        return;
+      }
+      this.opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
       this.client.on(ClientEvent.Sync, onSync);
     });
   }
