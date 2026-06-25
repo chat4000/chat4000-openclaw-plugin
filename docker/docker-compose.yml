@@ -4,19 +4,3 @@ services:
     container_name: chat4000-openclaw
     ports:
       - "18789:18789"
-    networks:
-      - clawnet
-
-  relay:
-    build:
-      context: ../../chat4000-server
-      dockerfile: ${PWD}/relay/Dockerfile
-    container_name: chat4000-relay
-    ports:
-      - "7890:7890"
-    networks:
-      - clawnet
-
-networks:
-  clawnet:
-    driver: bridge

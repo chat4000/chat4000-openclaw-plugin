@@ -18,3 +18,5 @@ docker commit chat4000-openclaw chat4000/openclaw:snapshot-2-authed
 
 echo "=== Snapshot 2 saved: chat4000/openclaw:snapshot-2-authed ==="
 echo "Next: run snapshot-3-plugin.sh to install the Chat4000 plugin"
+echo "After snapshot 3, pair with the current Matrix/registrar flow:"
+echo "  Use the Chat4000 setup subcommand inside the container."
