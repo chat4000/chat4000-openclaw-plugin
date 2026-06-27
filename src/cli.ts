@@ -22,7 +22,7 @@ import {
   type PairStatusResult,
 } from "./pairing/registrar.js";
 import { checkPluginVersion, formatVersionNotice } from "./pairing/version-check.js";
-import { renderQr, startHumanPairing } from "./pairing/qr.js";
+import { formatPairingCodeForDisplay, renderQr, startHumanPairing } from "./pairing/qr.js";
 import { resolveChat4000AccountStateDir } from "./paths.js";
 import {
   clearChat4000SessionBinding,
@@ -664,7 +664,7 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
     registeredAt: Date.now(),
     deviceIds: [],
   });
-  output.write(`Pairing code: ${pairing.code}\n`);
+  output.write(`Pairing code: ${formatPairingCodeForDisplay(pairing.code)}\n`);
   await renderQr(pairing.qrUri, (line) => output.write(`${line}\n`));
   output.write(`Redeem in the chat4000 app within ${ttlSeconds}s.\n`);
   if (reusable) {

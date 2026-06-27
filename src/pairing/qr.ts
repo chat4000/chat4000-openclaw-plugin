@@ -51,6 +51,17 @@ export async function startHumanPairing(params: {
   };
 }
 
+/**
+ * Format a 6-digit pairing code for HUMAN display as `NNN-NNN` (e.g. 547973 →
+ * 547-973), matching the installer + Hermes plugin. The dash is COSMETIC only:
+ * the raw, dash-less code is what goes into the URL/QR/registrar/link (the
+ * link's code is intentionally dash-less — never dash it there). Guarded on
+ * exactly six digits, so any non-standard code is shown verbatim.
+ */
+export function formatPairingCodeForDisplay(code: string): string {
+  return /^\d{6}$/.test(code) ? `${code.slice(0, 3)}-${code.slice(3)}` : code;
+}
+
 /** The universal pairing link encoded in the QR: `https://pair.chat4000.com/?code=<code>`. */
 export function buildQrUri(payload: { code: string }): string {
   const params = new URLSearchParams({ code: payload.code });
