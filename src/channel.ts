@@ -729,10 +729,31 @@ async function handleInbound(params: {
 }): Promise<void> {
   const { message, handle, ctx, runtimeLogger, versionBlock } = params;
 
+  // DEBUG timing anchor (T0 for the blue-tick latency probe): the instant the
+  // plugin accepts the inbound message. Pairs with runtime.receipt_send_* below
+  // so the round-trip "user sent -> plugin read-receipt -> phone blue tick" can
+  // be attributed per hop. Only emitted at --runtime-log-level debug.
+  runtimeLogger.debug("runtime.inbound_received", {
+    msg_id: message.eventId,
+    room: message.roomId,
+  });
+
   // Flow-B ack: send a read receipt as soon as we accept the message (text or
   // media), before the agent runs, so the delivered/read indicator lights up.
+  // DEBUG-timed: log when we ISSUE the receipt POST and when the gateway ACKs it
+  // (receipt_send_done.ms = the plugin->gateway round-trip). If that ms is small
+  // but the phone's blue tick is seconds late, the delay is downstream (the
+  // gateway -> phone sliding-sync delivery), not the plugin's emit.
+  const receiptStartedAt = Date.now();
+  runtimeLogger.debug("runtime.receipt_send_start", { msg_id: message.eventId });
   handle
     .sendReadReceipt(message.roomId, message.eventId)
+    .then(() =>
+      runtimeLogger.debug("runtime.receipt_send_done", {
+        msg_id: message.eventId,
+        ms: Date.now() - receiptStartedAt,
+      }),
+    )
     .catch((err: unknown) => report(err, "channel.sendReadReceipt"));
 
   // PROTOCOL C.5: a force_upgrade plugin must NOT relay messages. Reply once with
@@ -967,10 +988,22 @@ async function dispatchToAgentInner(params: {
   let currentState: AgentStatusState = "idle";
   let statusTimer: ReturnType<typeof setInterval> | undefined;
   const pushStatus = (state: AgentStatusState): void => {
+    // DEBUG timing: when each status frame (thinking/working/idle) is ISSUED and
+    // ACK'd by the gateway. The phone tends to receive the read receipt bundled
+    // with the next status timeline event, so lining status_send_* up against
+    // receipt_send_* and the phone's sync time pinpoints which hop adds the lag.
+    const statusStartedAt = Date.now();
+    runtimeLogger.debug("runtime.status_send_start", { msg_id: questionEventId, state });
     // Fire-and-forget; status is best-effort, but route any failure to the sink.
-    sendAgentStatus(handle.client, roomId, state, questionEventId).catch((err: unknown) =>
-      report(err, "channel.setStatus"),
-    );
+    sendAgentStatus(handle.client, roomId, state, questionEventId)
+      .then(() =>
+        runtimeLogger.debug("runtime.status_send_done", {
+          msg_id: questionEventId,
+          state,
+          ms: Date.now() - statusStartedAt,
+        }),
+      )
+      .catch((err: unknown) => report(err, "channel.setStatus"));
   };
   const setStatus = (state: AgentStatusState): void => {
     if (state === currentState) return; // a transition is a CHANGE; the timer keeps it alive
