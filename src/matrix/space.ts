@@ -7,9 +7,10 @@
  * state event so the app can classify it; the control room also carries an
  * `m.room.name`. Rooms are linked to the space with `m.space.child` / `m.space.parent`.
  *
- * Creation is idempotent: the resolved {spaceId, controlRoomId} are persisted per
- * account, and re-verified against the synced state before reuse, so a restart
- * never spawns duplicates.
+ * Creation is a one-time `setup` act: the resolved {spaceId, controlRoomId} are
+ * persisted per account; setup verifies membership via `GET /joined_rooms` before
+ * reuse, and the gateway boot only LOADS the persisted workspace (never creates),
+ * so a restart can never spawn a duplicate.
  */
 import { type ICreateRoomOpts, type MatrixClient, Preset, Visibility } from "matrix-js-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -67,13 +68,6 @@ async function sendState(
   stateKey: string,
 ): Promise<void> {
   await sendCustomStateEvent(client, roomId, type, content, stateKey);
-}
-
-/** True if the client is joined to a room with this id (per synced state). */
-function isJoined(client: MatrixClient, roomId: string | undefined): boolean {
-  if (!roomId) return false;
-  const room = client.getRoom(roomId);
-  return Boolean(room && room.getMyMembership() === "join");
 }
 
 type IsJoinedFn = (roomId: string | undefined) => boolean;
@@ -143,14 +137,45 @@ async function ensureRoomsWith(
 }
 
 /**
- * Ensure the plugin's space and its single control room exist; create them on
- * first run. Idempotent — reuses persisted ids when still joined.
+ * Gateway-boot resolver (PROTOCOL E): LOAD the persisted workspace and verify
+ * membership authoritatively via `GET /joined_rooms`. It NEVER creates rooms.
+ *
+ * Creation is a one-time `setup` act ({@link ensurePluginRoomsViaApi}). The old
+ * boot path created "what's missing" using the in-memory synced state
+ * (`getRoom`), which is empty for a beat right after a cold boot — so a routine
+ * gateway restart (e.g. the installer's post-pairing reload) could read
+ * "not joined to my own workspace" and mint a DUPLICATE space+control,
+ * overwriting rooms.json and orphaning the paired conversation. Boot now only
+ * resolves an existing workspace and never forks one:
+ *   - no persisted workspace  → throw (run `setup`)
+ *   - persisted but not joined → throw (re-run `setup`; never silently duplicate)
  */
 export async function ensurePluginRooms(
   client: MatrixClient,
   params: { accountId: string; pluginName: string },
 ): Promise<PluginRooms> {
-  return ensureRoomsWith(client, params, (roomId) => isJoined(client, roomId));
+  // F1: boot loads, never creates.
+  const stored = readPluginRooms(params.accountId);
+  if (!stored.spaceId || !stored.controlRoomId) {
+    throw new Error(
+      `chat4000: no persisted workspace for account "${params.accountId}" ` +
+        "(rooms.json missing or partial). Run `openclaw chat4000 setup` first — " +
+        "the gateway must not create a workspace on boot.",
+    );
+  }
+  // F2: authoritative membership from the server (GET /joined_rooms), NOT the
+  // synced state, which is unpopulated for a beat after a cold boot — the source
+  // of the duplicate-workspace race.
+  const { joined_rooms } = await client.getJoinedRooms();
+  const joinedSet = new Set(joined_rooms);
+  if (!joinedSet.has(stored.spaceId) || !joinedSet.has(stored.controlRoomId)) {
+    throw new Error(
+      "chat4000: bot is not joined to its persisted workspace " +
+        `(space=${stored.spaceId}, control=${stored.controlRoomId}). Refusing to ` +
+        "mint a duplicate — re-run `openclaw chat4000 setup` if the workspace was lost.",
+    );
+  }
+  return { spaceId: stored.spaceId, controlRoomId: stored.controlRoomId };
 }
 
 /**
