@@ -50,7 +50,12 @@ const CORE_RULE =
   "answer for the current turn in a chat4000 session. This is the native rich " +
   "final surface for chat4000. The card replaces the text answer: call this tool " +
   "once per turn, with finished HTML (never partial or streamed), and do not also " +
-  "send a text final answer.";
+  "send a text final answer. " +
+  "final_card is the ONLY way to show a card: a card is displayed ONLY by calling " +
+  "this tool. Do NOT put the card HTML in your text reply and do NOT write it to a " +
+  "file — raw HTML in a text answer renders as literal text (it never becomes a " +
+  "card), and a written .html file is never shown to the user. To show a card you " +
+  "MUST call final_card with the HTML.";
 
 const WHEN_TO_USE = `Use final_card when the final answer is structured, glanceable data rather than
 plain prose — weather, knowledge panels, status, lists, agendas, etc.
@@ -66,7 +71,14 @@ ACCESS. No external fonts, no remote images, no CDN libraries — inline everyth
 use emoji, inline SVG, or pure CSS for graphics. The chat behind the card is
 near-black (#0F0F0F): leave html/body transparent and draw your own surface (the
 TEMPLATE below provides it). Design for phone width: max-width ~420px, 12-13px
-mono body text, generous padding.`;
+mono body text, generous padding.
+
+ROBUSTNESS — the card width varies (~340–420px); content must NEVER overflow
+horizontally or wrap awkwardly. Keep pills, badges, and short labels on one line
+(white-space:nowrap). Let long text wrap (overflow-wrap:anywhere). Avoid fixed
+pixel widths over ~300px and long unbreakable strings. Every row must survive a
+narrow width without clipping, a single word breaking the layout, or a 2-word
+label wrapping to two lines.`;
 
 const STYLE_GUIDE = `STYLE GUIDE — dark, minimal, terminal/monospace; a developer tool, not a consumer
 app. Surfaces: card #141414, raised inner panels #1A1A1A, 1px borders
@@ -89,13 +101,15 @@ inside .c4k and reuse its CSS variables and helper classes:
 --text:#FFF;--body:#E0E0E0;--label:#9CA3AF;--muted:#666;--pink:#EC4899;
 --pink-hi:#F472B6;--blue:#53BDEB;background:#141414;border:1px solid var(--border);
 border-radius:14px;padding:20px;max-width:420px;color:var(--body);
-font:13px/1.5 ui-monospace,"SF Mono",Menlo,monospace}
+font:13px/1.5 ui-monospace,"SF Mono",Menlo,monospace;box-sizing:border-box;overflow-wrap:anywhere}
+.c4k *{box-sizing:border-box;min-width:0}
+.c4k svg,.c4k img{max-width:100%;height:auto}
 .c4k .k{color:var(--label);font-size:11px;font-weight:500;text-transform:uppercase;
 letter-spacing:.08em}
 .c4k .row{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .c4k .pill{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;
 font-weight:500;background:rgba(255,255,255,.04);border:1px solid var(--border);
-color:var(--label)}
+color:var(--label);white-space:nowrap}
 .c4k .pill.pink{background:rgba(236,72,153,.12);border-color:rgba(236,72,153,.35);
 color:var(--pink-hi)}
 .c4k .pill.blue{background:rgba(83,189,235,.10);border-color:rgba(83,189,235,.30);
