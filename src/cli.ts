@@ -1,5 +1,5 @@
 import process, { stdout as output } from "node:process";
-import { rmSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { resolveChat4000Account } from "./accounts.js";
 import { dumpChat4000Trace } from "./error-log.js";
 import { deleteMatrixCredentials } from "./matrix/credentials.js";
@@ -42,6 +42,26 @@ import {
 } from "./telemetry.js";
 import { flushAllTelemetry, registerPairedClientId, track } from "./analytics.js";
 import { buildWizardEnvSummary, runWizard } from "./wizard.js";
+
+// IN11: granular pair-outcome contract shared with the installer + the Hermes
+// plugin + the analytics registry. `pair` writes the outcome (one canonical enum
+// line) to $CHAT4000_PAIR_OUTCOME_FILE (mechanism A) AND exits with a distinct
+// code per failure (mechanism B); the installer reads the file, falling back to
+// the exit code. Values: paired | paired_reusable | pending_reusable |
+// pending_window_elapsed | expired | registrar_error | code_emit_timeout |
+// launch_failed | cancelled | unknown.
+const PAIR_OUTCOME_ENV = "CHAT4000_PAIR_OUTCOME_FILE";
+const PAIR_EXIT_EXPIRED = 11;
+
+function writePairOutcome(outcome: string): void {
+  const path = process.env[PAIR_OUTCOME_ENV];
+  if (!path) return;
+  try {
+    writeFileSync(path, `${outcome}\n`);
+  } catch {
+    // best-effort; the installer falls back to our exit code (mechanism B)
+  }
+}
 
 /**
  * Minimal structural view of the Commander `Command` the host passes in. Only
@@ -690,6 +710,7 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
         pollDelayMs = Math.min(pollDelayMs * 2, PAIR_STATUS_MAX_BACKOFF_MS);
         continue;
       }
+      writePairOutcome("registrar_error"); // IN11
       throw error; // permanent registrar error — surfaced via handleCliError
     }
     pollDelayMs = PAIR_STATUS_POLL_INTERVAL_MS; // a successful poll resets the backoff
@@ -731,18 +752,20 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
           "Code stays redeemable until expiry; the gateway keeps listening for more devices.\n",
         );
       }
+      writePairOutcome(reusable ? "paired_reusable" : "paired"); // IN11
       return;
     }
     if (status.status === "expired") {
       removeOutstandingCode(account.accountId, pairing.code);
       output.write('Pairing code expired. Re-run "openclaw chat4000 pair".\n');
-      // IN10: a real expiry must signal FAILURE via a non-zero exit. The installer
-      // reads ONLY our exit code to judge pairing; a 0 here made it report a
-      // false "device paired" success on an expired code.
-      process.exitCode = 1;
+      // IN10/IN11: a real expiry signals FAILURE — distinct outcome (A) + a
+      // distinct exit code (B); the installer reads either.
+      writePairOutcome("expired");
+      process.exitCode = PAIR_EXIT_EXPIRED;
       return;
     }
   }
+  writePairOutcome("pending_window_elapsed"); // IN11: code still live, not a failure
   output.write(
     "Pairing window elapsed. The gateway keeps listening for this code until it " +
       'expires; re-run "openclaw chat4000 pair" for a fresh code.\n',
