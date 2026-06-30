@@ -736,6 +736,10 @@ async function runPair(api: PluginApiLike, opts: PairCommandOptions): Promise<vo
     if (status.status === "expired") {
       removeOutstandingCode(account.accountId, pairing.code);
       output.write('Pairing code expired. Re-run "openclaw chat4000 pair".\n');
+      // IN10: a real expiry must signal FAILURE via a non-zero exit. The installer
+      // reads ONLY our exit code to judge pairing; a 0 here made it report a
+      // false "device paired" success on an expired code.
+      process.exitCode = 1;
       return;
     }
   }
